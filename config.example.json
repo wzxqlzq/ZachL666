@@ -1,0 +1,42 @@
+{
+  "run": {
+    "mode": "once",
+    "timezone": "Asia/Shanghai"
+  },
+  "selector": {
+    "provider": "rule_based",
+    "csv_path": "data/candidates.csv",
+    "universe_csv_path": "data/stock_universe.csv",
+    "min_avg_amount_20": 500000000,
+    "min_atr_ratio": 0.03,
+    "max_atr_ratio": 0.07,
+    "min_market_cap": 20000000000
+  },
+  "market_data": {
+    "provider": "eastmoney",
+    "daily_csv_path": "data/sample_daily.csv",
+    "lookback_days": 220,
+    "adjust": "qfq"
+  },
+  "strategy": {
+    "entry_window": 20,
+    "exit_window": 10,
+    "atr_window": 20,
+    "risk_per_trade": 0.01,
+    "confirm_minutes": 5
+  },
+  "email": {
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "username": "your_email@example.com",
+    "password": "your_smtp_app_password",
+    "sender": "your_email@example.com",
+    "recipients": ["your_email@example.com"]
+  },
+  "paths": {
+    "portfolio": "portfolio.json",
+    "signal_db": "state/signals.json",
+    "orders_dir": "orders",
+    "log_file": "logs/alerts.log"
+  }
+}

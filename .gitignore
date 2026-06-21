@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+test_tmp/
+logs/
+orders/
+state/
+selection_results/
+data/offline/sync_failures.csv
+config.json
+portfolio.json

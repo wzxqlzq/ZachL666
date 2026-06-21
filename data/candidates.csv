@@ -1,0 +1,4 @@
+symbol,name,reason,status
+600000.SH,SPD Bank,manual,
+000001.SZ,Ping An Bank,manual,
+000002.SZ,ST Example,excluded,exclude

@@ -1,0 +1,15 @@
+{
+  "cash": 100000,
+  "positions": {
+    "600000.SH": {
+      "shares": 1000,
+      "avg_cost": 7.5,
+      "buy_date": "2026-06-18"
+    },
+    "000001.SZ": {
+      "shares": 0,
+      "avg_cost": 0,
+      "buy_date": null
+    }
+  }
+}

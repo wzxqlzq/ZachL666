@@ -1,0 +1,197 @@
+import csv
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from pathlib import Path
+from typing import Protocol
+
+from models import Bar, Quote
+
+
+class StockUniverseProvider(Protocol):
+    def load_universe(self) -> list[dict[str, str]]:
+        ...
+
+
+class OfflineDataStore:
+    def __init__(self, root: str = "data/offline"):
+        self.root = Path(root)
+        self.daily_dir = self.root / "daily_bars"
+        self.universe_path = self.root / "stock_universe.csv"
+
+    def save_universe(self, rows: list[dict[str, str]]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["symbol", "name", "exchange", "market_cap", "status", "updated_at"]
+        today = date.today().isoformat()
+        normalized = []
+        for row in rows:
+            normalized.append(
+                {
+                    "symbol": row.get("symbol", ""),
+                    "name": row.get("name", ""),
+                    "exchange": row.get("exchange", ""),
+                    "market_cap": row.get("market_cap", "0"),
+                    "status": row.get("status", ""),
+                    "updated_at": row.get("updated_at") or today,
+                }
+            )
+        with self.universe_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(normalized)
+
+    def load_universe(self) -> list[dict[str, str]]:
+        if not self.universe_path.exists():
+            return []
+        with self.universe_path.open("r", encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def save_bars(self, symbol: str, bars: list[Bar]) -> None:
+        self.daily_dir.mkdir(parents=True, exist_ok=True)
+        merged = {bar.trade_date: bar for bar in self.load_bars(symbol)}
+        for bar in bars:
+            merged[bar.trade_date] = bar
+        path = self._bar_path(symbol)
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["date", "symbol", "open", "high", "low", "close", "volume", "amount"],
+            )
+            writer.writeheader()
+            for bar in sorted(merged.values(), key=lambda item: item.trade_date):
+                writer.writerow(
+                    {
+                        "date": bar.trade_date.isoformat(),
+                        "symbol": bar.symbol,
+                        "open": f"{bar.open:.4f}",
+                        "high": f"{bar.high:.4f}",
+                        "low": f"{bar.low:.4f}",
+                        "close": f"{bar.close:.4f}",
+                        "volume": bar.volume,
+                        "amount": "" if bar.amount is None else f"{bar.amount:.2f}",
+                    }
+                )
+
+    def load_bars(self, symbol: str, end_date: date | None = None) -> list[Bar]:
+        path = self._bar_path(symbol)
+        if not path.exists():
+            return []
+        bars: list[Bar] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                trade_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
+                if end_date and trade_date > end_date:
+                    continue
+                bars.append(
+                    Bar(
+                        symbol=row["symbol"],
+                        trade_date=trade_date,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=int(float(row["volume"])),
+                        amount=float(row["amount"]) if row.get("amount") else None,
+                    )
+                )
+        return sorted(bars, key=lambda item: item.trade_date)
+
+    def latest_bar_date(self, symbol: str) -> date | None:
+        bars = self.load_bars(symbol)
+        return bars[-1].trade_date if bars else None
+
+    def has_bars(self, symbol: str) -> bool:
+        return self._bar_path(symbol).exists()
+
+    def _bar_path(self, symbol: str) -> Path:
+        return self.daily_dir / f"{symbol}.csv"
+
+
+class OfflineMarketDataProvider:
+    def __init__(self, store: OfflineDataStore):
+        self.store = store
+
+    def load_daily_bars(self, symbol: str, end_date: date | None = None) -> list[Bar]:
+        return self.store.load_bars(symbol, end_date=end_date)
+
+    def get_quote(self, symbol: str, at: datetime | None = None) -> Quote:
+        bars = self.store.load_bars(symbol)
+        if not bars:
+            raise ValueError(f"No offline bars found for {symbol}")
+        latest = bars[-1]
+        return Quote(
+            symbol=symbol,
+            timestamp=at or datetime.combine(latest.trade_date, datetime.min.time()),
+            price=latest.close,
+            open=latest.open,
+            high=latest.high,
+            low=latest.low,
+            volume=latest.volume,
+        )
+
+
+class OfflineDataSync:
+    def __init__(
+        self,
+        store: OfflineDataStore,
+        universe_provider: StockUniverseProvider,
+        market_data_provider,
+        workers: int = 6,
+        request_delay_seconds: float = 0.0,
+        max_retries: int = 0,
+    ):
+        self.store = store
+        self.universe_provider = universe_provider
+        self.market_data_provider = market_data_provider
+        self.workers = workers
+        self.request_delay_seconds = request_delay_seconds
+        self.max_retries = max_retries
+
+    def sync_universe(self) -> int:
+        rows = self.universe_provider.load_universe()
+        self.store.save_universe(rows)
+        return len(rows)
+
+    def sync_bars(
+        self,
+        symbols: list[str] | None = None,
+        limit: int = 0,
+        skip_existing: bool = False,
+    ) -> tuple[int, list[tuple[str, str]]]:
+        rows = self.store.load_universe()
+        selected_symbols = symbols or [row["symbol"] for row in rows if row.get("symbol")]
+        if skip_existing:
+            selected_symbols = [symbol for symbol in selected_symbols if not self.store.has_bars(symbol)]
+        if limit:
+            selected_symbols = selected_symbols[:limit]
+
+        failures: list[tuple[str, str]] = []
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(self._load_daily_bars_with_retry, symbol): symbol
+                for symbol in selected_symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    bars = future.result()
+                    if bars:
+                        self.store.save_bars(symbol, bars)
+                    success_count += 1
+                except Exception as exc:
+                    failures.append((symbol, str(exc)))
+        return success_count, failures
+
+    def _load_daily_bars_with_retry(self, symbol: str) -> list[Bar]:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            if self.request_delay_seconds and attempt == 0:
+                time.sleep(self.request_delay_seconds)
+            try:
+                return self.market_data_provider.load_daily_bars(symbol)
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.request_delay_seconds or 1.0)
+        raise last_error or RuntimeError(f"Failed to load bars for {symbol}")

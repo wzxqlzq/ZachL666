@@ -1,0 +1,5 @@
+symbol,name,exchange,market_cap,status
+600000.SH,SPD Bank,SH,21000000000,
+000001.SZ,Ping An Bank,SZ,30000000000,
+430001.BJ,Beijing Example,BJ,50000000000,
+000002.SZ,ST Example,SZ,50000000000,exclude
