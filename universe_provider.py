@@ -1,5 +1,6 @@
 import csv
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -91,7 +92,14 @@ class AkshareStockUniverseProvider:
 
 
 class EastmoneyStockUniverseProvider:
-    def __init__(self, session: Any | None = None, retries: int = 3, retry_sleep_seconds: float = 1.0):
+    def __init__(
+        self,
+        session: Any | None = None,
+        retries: int = 3,
+        retry_sleep_seconds: float = 1.0,
+        request_delay_seconds: float = 0.0,
+        page_size: int = 20,
+    ):
         if session is None:
             import requests
 
@@ -99,15 +107,22 @@ class EastmoneyStockUniverseProvider:
         self.session = session
         self.retries = retries
         self.retry_sleep_seconds = retry_sleep_seconds
-        self.headers = {"User-Agent": "Mozilla/5.0"}
+        self.request_delay_seconds = request_delay_seconds
+        self.page_size = page_size
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+        }
 
     def load_universe(self) -> list[dict[str, str]]:
         url = "https://82.push2.eastmoney.com/api/qt/clist/get"
         rows: list[dict[str, str]] = []
         page = 1
-        page_size = 200
         while True:
-            payload = self._get_page(url, page, page_size)
+            if self.request_delay_seconds and page > 1:
+                time.sleep(self.request_delay_seconds)
+            payload = self._get_page(url, page, self.page_size)
             data = payload.get("data") or {}
             diff = data.get("diff") or []
             if not diff:
@@ -127,6 +142,42 @@ class EastmoneyStockUniverseProvider:
             if len(rows) >= int(data.get("total") or 0):
                 break
             page += 1
+        return rows
+
+    def load_market_cap(self, symbol: str) -> dict[str, str]:
+        rows = self.load_market_caps([symbol])
+        if not rows:
+            raise ValueError(f"No Eastmoney market cap found for {symbol}")
+        return rows[0]
+
+    def load_market_caps(self, symbols: list[str]) -> list[dict[str, str]]:
+        if not symbols:
+            return []
+        payload = self._get_json(
+            "https://push2.eastmoney.com/api/qt/ulist.np/get",
+            {
+                "fltt": 2,
+                "invt": 2,
+                "fields": "f12,f13,f14,f20,f21",
+                "secids": ",".join(self._secid(symbol) for symbol in symbols),
+            },
+        )
+        code_to_symbol = {symbol.split(".")[0]: symbol for symbol in symbols}
+        rows: list[dict[str, str]] = []
+        for item in (payload.get("data") or {}).get("diff") or []:
+            code = str(item.get("f12") or "")
+            symbol = code_to_symbol.get(code)
+            if not symbol:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": str(item.get("f14") or ""),
+                    "exchange": self._exchange(symbol),
+                    "market_cap": str(item.get("f20") or 0),
+                    "status": "",
+                }
+            )
         return rows
 
     def _get_page(self, url: str, page: int, page_size: int) -> dict:
@@ -168,11 +219,122 @@ class EastmoneyStockUniverseProvider:
             return "SZ"
         return ""
 
+    def _secid(self, symbol: str) -> str:
+        code = symbol.split(".")[0]
+        suffix = symbol.split(".")[-1].upper() if "." in symbol else ""
+        if suffix == "SH" or code.startswith(("60", "68", "90", "51", "52", "58")):
+            return f"1.{code}"
+        return f"0.{code}"
+
+    def _exchange(self, symbol: str) -> str:
+        if "." in symbol:
+            return symbol.split(".")[-1].upper()
+        code = symbol.split(".")[0]
+        if code.startswith(("60", "68", "90", "51", "52", "58")):
+            return "SH"
+        if code.startswith(("43", "83", "87", "88", "92")):
+            return "BJ"
+        return "SZ"
+
+
+class TencentStockUniverseProvider:
+    def __init__(
+        self,
+        session: Any | None = None,
+        retries: int = 3,
+        retry_sleep_seconds: float = 1.0,
+        page_size: int = 100,
+    ):
+        if session is None:
+            import requests
+
+            session = requests
+        self.session = session
+        self.retries = retries
+        self.retry_sleep_seconds = retry_sleep_seconds
+        self.page_size = page_size
+        self.headers = {"User-Agent": "Mozilla/5.0"}
+
+    def load_universe(self) -> list[dict[str, str]]:
+        raise NotImplementedError("TencentStockUniverseProvider only supports market-cap refresh")
+
+    def load_market_cap(self, symbol: str) -> dict[str, str]:
+        rows = self.load_market_caps([symbol])
+        if not rows:
+            raise ValueError(f"No Tencent market cap found for {symbol}")
+        return rows[0]
+
+    def load_market_caps(self, symbols: list[str]) -> list[dict[str, str]]:
+        if not symbols:
+            return []
+        payload = self._get_text(
+            "https://qt.gtimg.cn/q=" + ",".join(self._q_symbol(symbol) for symbol in symbols)
+        )
+        q_to_symbol = {self._q_symbol(symbol): symbol for symbol in symbols}
+        rows: list[dict[str, str]] = []
+        for part in payload.split(";"):
+            if not part.strip() or "=" not in part:
+                continue
+            variable, raw = part.split("=", 1)
+            q_symbol = variable.replace("v_", "").strip()
+            symbol = q_to_symbol.get(q_symbol)
+            if not symbol:
+                continue
+            fields = raw.strip().strip('"').split("~")
+            if len(fields) <= 45 or fields[45] in {"", "-"}:
+                continue
+            market_cap = Decimal(fields[45]) * Decimal("100000000")
+            if market_cap <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": fields[1] if len(fields) > 1 else "",
+                    "exchange": self._exchange(symbol),
+                    "market_cap": str(int(market_cap)),
+                    "status": "",
+                }
+            )
+        return rows
+
+    def _get_text(self, url: str) -> str:
+        last_error: Exception | None = None
+        for attempt in range(self.retries):
+            try:
+                response = self.session.get(url, timeout=20, headers=self.headers)
+                response.raise_for_status()
+                return response.text
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.retries - 1:
+                    time.sleep(self.retry_sleep_seconds)
+        raise RuntimeError(f"Tencent market-cap request failed after {self.retries} attempts: {last_error}") from last_error
+
+    def _q_symbol(self, symbol: str) -> str:
+        code = symbol.split(".")[0]
+        suffix = symbol.split(".")[-1].upper() if "." in symbol else ""
+        if suffix == "SH" or code.startswith(("60", "68", "90", "51", "52", "58")):
+            return f"sh{code}"
+        if suffix == "BJ" or code.startswith(("43", "83", "87", "88", "92")):
+            return f"bj{code}"
+        return f"sz{code}"
+
+    def _exchange(self, symbol: str) -> str:
+        if "." in symbol:
+            return symbol.split(".")[-1].upper()
+        code = symbol.split(".")[0]
+        if code.startswith(("60", "68", "90", "51", "52", "58")):
+            return "SH"
+        if code.startswith(("43", "83", "87", "88", "92")):
+            return "BJ"
+        return "SZ"
+
 
 class FallbackStockUniverseProvider:
     def __init__(self, primary: StockUniverseProvider, fallback: StockUniverseProvider | None = None):
         self.primary = primary
         self.fallback = fallback
+        self.page_size = int(getattr(primary, "page_size", getattr(fallback, "page_size", 20)))
 
     def load_universe(self) -> list[dict[str, str]]:
         try:
@@ -181,3 +343,37 @@ class FallbackStockUniverseProvider:
             if self.fallback is None:
                 raise
             return self.fallback.load_universe()
+
+    def load_market_cap(self, symbol: str) -> dict[str, str]:
+        try:
+            return self.primary.load_market_cap(symbol)  # type: ignore[attr-defined]
+        except Exception:
+            if self.fallback is None:
+                raise
+            return self.fallback.load_market_cap(symbol)  # type: ignore[attr-defined]
+
+    def load_market_caps(self, symbols: list[str]) -> list[dict[str, str]]:
+        try:
+            primary_rows = self.primary.load_market_caps(symbols)  # type: ignore[attr-defined]
+        except Exception:
+            if self.fallback is None:
+                raise
+            return self.fallback.load_market_caps(symbols)  # type: ignore[attr-defined]
+
+        if self.fallback is None:
+            return primary_rows
+
+        found_symbols = {
+            row.get("symbol", "")
+            for row in primary_rows
+            if row.get("symbol") and self._market_cap_value(row) > 0
+        }
+        missing_symbols = [symbol for symbol in symbols if symbol not in found_symbols]
+        if not missing_symbols:
+            return primary_rows
+        fallback_rows = self.fallback.load_market_caps(missing_symbols)  # type: ignore[attr-defined]
+        return primary_rows + fallback_rows
+
+    def _market_cap_value(self, row: dict[str, str]) -> float:
+        raw = row.get("market_cap") or row.get("total_market_cap") or "0"
+        return float(str(raw).replace(",", ""))

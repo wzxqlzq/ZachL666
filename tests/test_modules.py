@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 TMP_ROOT = Path(__file__).resolve().parents[1] / "test_tmp"
@@ -14,11 +15,17 @@ from models import Bar, Position, Quote, Signal, StockCandidate
 from notifier import EmailNotifier, EmailSender
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
 from runner import Runner
+from run_weekly_update import run_weekly_update
 from signal_store import SignalStore
 from stock_selector import CsvStockSelector, RuleBasedStockSelector
 from strategy import TurtleStrategyEngine
 from trade_gateway import AlertTradeGateway
-from universe_provider import AkshareStockUniverseProvider, FallbackStockUniverseProvider
+from universe_provider import (
+    AkshareStockUniverseProvider,
+    EastmoneyStockUniverseProvider,
+    FallbackStockUniverseProvider,
+    TencentStockUniverseProvider,
+)
 
 
 class FakeEmailSender(EmailSender):
@@ -63,6 +70,61 @@ class FakeUniverseProvider:
                 "status": "",
             }
         ]
+
+
+class FakeMarketCapUniverseProvider:
+    def load_universe(self):
+        return [
+            {
+                "symbol": "000001.SZ",
+                "name": "Normal",
+                "exchange": "SZ",
+                "market_cap": "33000000000",
+                "status": "",
+            }
+        ]
+
+    def load_market_cap(self, symbol):
+        return self.load_market_caps([symbol])[0]
+
+    def load_market_caps(self, symbols):
+        return [
+            {
+                "symbol": symbol,
+                "name": "Normal",
+                "exchange": symbol.split(".")[-1],
+                "market_cap": "33000000000",
+                "status": "",
+            }
+            for symbol in symbols
+        ]
+
+
+class FakeSingleMarketCapProvider:
+    def __init__(self):
+        self.calls = []
+
+    def load_universe(self):
+        return []
+
+    def load_market_cap(self, symbol):
+        self.calls.append(symbol)
+        return {
+            "symbol": symbol,
+            "name": "",
+            "exchange": symbol.split(".")[-1],
+            "market_cap": "33000000000",
+            "status": "",
+        }
+
+
+class CountingMarketCapProvider(FakeMarketCapUniverseProvider):
+    def __init__(self):
+        self.calls = []
+
+    def load_market_caps(self, symbols):
+        self.calls.append(list(symbols))
+        return super().load_market_caps(symbols)
 
 
 class MapMarketData:
@@ -271,6 +333,138 @@ class FakeEastmoneySession:
                 },
             ]
         )
+
+
+class FakeEastmoneyUniverseSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, params, timeout, headers):
+        self.calls.append({"url": url, "params": params, "timeout": timeout, "headers": headers})
+        if "ulist" in url:
+            return FakeResponse(
+                {
+                    "rc": 0,
+                    "data": {
+                        "total": 1,
+                        "diff": [
+                            {
+                                "f12": "000001",
+                                "f13": 0,
+                                "f14": "Ping An",
+                                "f20": 33000000000,
+                                "f21": 32000000000,
+                            }
+                        ],
+                    },
+                }
+            )
+        page = params["pn"]
+        if page == 1:
+            return FakeResponse(
+                {
+                    "rc": 0,
+                    "data": {
+                        "total": 3,
+                        "diff": [
+                            {"f12": "000001", "f13": 0, "f14": "Ping An", "f20": 33000000000},
+                            {"f12": "600000", "f13": 1, "f14": "Pufa", "f20": 42000000000},
+                        ],
+                    },
+                }
+            )
+        return FakeResponse(
+            {
+                "rc": 0,
+                "data": {
+                    "total": 3,
+                    "diff": [
+                        {"f12": "000002", "f13": 0, "f14": "Vanke", "f20": 21000000000},
+                    ],
+                },
+            }
+        )
+
+
+class FakeTencentSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, timeout, headers):
+        self.calls.append({"url": url, "timeout": timeout, "headers": headers})
+        return FakeTextResponse(
+            'v_sz300009="51~安科生物~300009~7.67~7.67~7.66~190563~96337~94227~7.66~391~7.65~501~7.64~56~7.63~35~7.62~61~7.67~343~7.68~63~7.69~373~7.70~414~7.71~959~~20260622153318~0.00~0.00~7.68~7.35~7.67/190563/142533271~190563~14253~1.55~18.47~~7.68~7.35~4.30~94.36~128.14";'
+            'v_bj920992="62~中科美菱~920992~12.79~12.65~12.55~14052~8165~5887~12.78~30~12.77~57~12.71~15~12.70~15~12.68~40~12.79~15~12.80~39~12.81~18~12.82~207~12.84~3~~20260622153502~0.14~1.11~12.88~12.08~12.79/14052/17473629~14052~1747.36~2.87~61.56~~12.88~12.08~6.32~6.27~12.37";'
+        )
+
+
+class FakeTextResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        return None
+
+
+class FailingMarketCapProvider:
+    page_size = 2
+
+    def load_universe(self):
+        return []
+
+    def load_market_cap(self, symbol):
+        raise RuntimeError("market cap unavailable")
+
+    def load_market_caps(self, symbols):
+        raise RuntimeError("market caps unavailable")
+
+
+class PartialMarketCapProvider:
+    page_size = 2
+
+    def load_universe(self):
+        return []
+
+    def load_market_caps(self, symbols):
+        return [
+            {
+                "symbol": symbols[0],
+                "name": "",
+                "exchange": symbols[0].split(".")[-1],
+                "market_cap": "33000000000",
+                "status": "",
+            }
+        ]
+
+
+class WeeklyArgs:
+    root = ""
+    output = ""
+    lookback_days = 14
+    workers = 1
+    limit = 0
+    failures_csv = ""
+    request_delay = 0.0
+    max_retries = 0
+    provider = "eastmoney"
+    fallback = "none"
+    akshare_timeout = 30
+    akshare_history_source = "sina"
+    market_cap_provider = "tencent"
+    market_cap_fallback = "none"
+    market_cap_page_size = 100
+    force_market_cap_refresh = False
+    target_date = "auto"
+    target_probe_symbol = "000001.SZ"
+    update_scope = "selection"
+    bar_worker_mode = "serial"
+    bar_workers = 1
+    bar_batch_size = 20
+    bar_timeout_seconds = 60
+    final_retry_provider = "none"
+    skip_up_to_date_bars = True
+    skip_existing_market_cap = False
+    skip_market_cap_refresh = False
 
 
 def make_bars(symbol="000001.SZ", count=20, high=10.0, low=8.0):
@@ -520,6 +714,59 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(market_data.calls, ["000001.SZ"])
         self.assertEqual(len(store.load_bars("000001.SZ")), 121)
 
+    def test_offline_sync_can_refresh_market_caps_without_touching_bars(self):
+        tmp = case_dir("offline_market_caps")
+        store = OfflineDataStore(str(tmp / "offline"))
+        store.save_universe(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "name": "Normal",
+                    "exchange": "SZ",
+                    "market_cap": "0",
+                    "status": "",
+                }
+            ]
+        )
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
+        sync = OfflineDataSync(
+            store=store,
+            universe_provider=FakeMarketCapUniverseProvider(),
+            market_data_provider=CountingMarketData({}),
+            workers=1,
+        )
+
+        updated_count, failures = sync.sync_market_caps()
+
+        self.assertEqual(updated_count, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(store.load_universe()[0]["market_cap"], "33000000000")
+        self.assertEqual(len(store.load_bars("000001.SZ")), 121)
+
+    def test_offline_sync_market_caps_can_skip_existing(self):
+        tmp = case_dir("offline_market_caps_skip_existing")
+        store = OfflineDataStore(str(tmp / "offline"))
+        store.save_universe(
+            [
+                {"symbol": "000001.SZ", "name": "A", "exchange": "SZ", "market_cap": "0", "status": ""},
+                {"symbol": "000002.SZ", "name": "B", "exchange": "SZ", "market_cap": "22000000000", "status": ""},
+            ]
+        )
+        provider = FakeSingleMarketCapProvider()
+        sync = OfflineDataSync(
+            store=store,
+            universe_provider=provider,
+            market_data_provider=CountingMarketData({}),
+            workers=1,
+        )
+
+        updated_count, failures = sync.sync_market_caps(skip_existing=True)
+
+        self.assertEqual(updated_count, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(provider.calls, ["000001.SZ"])
+        self.assertEqual(store.load_universe()[1]["market_cap"], "22000000000")
+
     def test_rule_selector_can_use_offline_provider(self):
         tmp = case_dir("offline_selection")
         store = OfflineDataStore(str(tmp / "offline"))
@@ -534,6 +781,154 @@ class MarketDataTests(unittest.TestCase):
         result = selector.select(date(2026, 5, 1))
 
         self.assertEqual([item.symbol for item in result], ["000001.SZ"])
+
+    def test_weekly_update_reuses_offline_universe_and_writes_selection(self):
+        tmp = case_dir("weekly_update")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ", count=120))
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.limit = 1
+        args.failures_csv = str(tmp / "failures.csv")
+        args.target_date = "2026-05-01"
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            bar_count, bar_failures, market_cap_count, market_cap_failures, output_path = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 1)
+        self.assertEqual(bar_failures, 0)
+        self.assertEqual(market_cap_count, 1)
+        self.assertEqual(market_cap_failures, 0)
+        self.assertEqual(output_path, output)
+        self.assertTrue(output.exists())
+        self.assertEqual(store.load_universe()[0]["symbol"], "000001.SZ")
+        self.assertGreater(len(store.load_bars("000001.SZ")), 120)
+
+    def test_weekly_update_skips_up_to_date_bars(self):
+        tmp = case_dir("weekly_update_skip_latest")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
+        market_data = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.failures_csv = str(tmp / "failures.csv")
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=market_data),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            bar_count, bar_failures, market_cap_count, market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 0)
+        self.assertEqual(bar_failures, 0)
+        self.assertEqual(market_cap_count, 1)
+        self.assertEqual(market_cap_failures, 0)
+        self.assertEqual(market_data.calls, [])
+
+    def test_weekly_update_skips_fresh_market_caps(self):
+        tmp = case_dir("weekly_update_skip_market_caps")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "name": "Normal",
+                    "exchange": "SZ",
+                    "market_cap": "30000000000",
+                    "status": "",
+                    "updated_at": "2026-05-01",
+                }
+            ]
+        )
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
+        market_data = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
+        market_caps = CountingMarketCapProvider()
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.failures_csv = str(tmp / "failures.csv")
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=market_data),
+            patch("run_weekly_update.build_universe_provider", return_value=market_caps),
+        ):
+            _bar_count, _bar_failures, market_cap_count, market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(market_cap_count, 0)
+        self.assertEqual(market_cap_failures, 0)
+        self.assertEqual(market_caps.calls, [])
+
+    def test_weekly_update_auto_target_uses_local_majority_date(self):
+        tmp = case_dir("weekly_update_local_target")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
+        market_data = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "auto"
+        args.failures_csv = str(tmp / "failures.csv")
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=market_data),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 0)
+        self.assertEqual(bar_failures, 0)
+        self.assertEqual(market_data.calls, [])
+
+    def test_weekly_update_selection_scope_filters_static_and_market_cap_rules(self):
+        tmp = case_dir("weekly_update_selection_scope")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(
+            [
+                {"symbol": "000001.SZ", "name": "Normal", "exchange": "SZ", "market_cap": "30000000000", "status": ""},
+                {"symbol": "000002.SZ", "name": "Small", "exchange": "SZ", "market_cap": "10000000000", "status": ""},
+                {"symbol": "000003.SZ", "name": "ST Bad", "exchange": "SZ", "market_cap": "30000000000", "status": ""},
+                {"symbol": "430001.BJ", "name": "Beijing", "exchange": "BJ", "market_cap": "30000000000", "status": ""},
+            ]
+        )
+        market_data = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+
+        with patch("run_weekly_update.build_market_data_provider", return_value=market_data):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 1)
+        self.assertEqual(bar_failures, 0)
+        self.assertEqual(market_data.calls, ["000001.SZ"])
 
     def test_fallback_market_data_provider_uses_fallback_on_failure(self):
         fallback = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
@@ -561,6 +956,56 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "000001.SZ")
         self.assertEqual(rows[0]["name"], "Ping An")
         self.assertEqual(rows[0]["market_cap"], "0")
+
+    def test_eastmoney_universe_provider_paginates_market_caps(self):
+        session = FakeEastmoneyUniverseSession()
+        provider = EastmoneyStockUniverseProvider(session=session, page_size=2)
+
+        rows = provider.load_universe()
+
+        self.assertEqual([row["symbol"] for row in rows], ["000001.SZ", "600000.SH", "000002.SZ"])
+        self.assertEqual(rows[0]["market_cap"], "33000000000")
+        self.assertEqual([call["params"]["pz"] for call in session.calls], [2, 2])
+
+    def test_eastmoney_universe_provider_loads_single_stock_market_cap(self):
+        session = FakeEastmoneyUniverseSession()
+        provider = EastmoneyStockUniverseProvider(session=session)
+
+        row = provider.load_market_cap("000001.SZ")
+
+        self.assertEqual(row["symbol"], "000001.SZ")
+        self.assertEqual(row["market_cap"], "33000000000")
+        self.assertEqual(session.calls[0]["params"]["secids"], "0.000001")
+
+    def test_tencent_universe_provider_loads_market_caps(self):
+        session = FakeTencentSession()
+        provider = TencentStockUniverseProvider(session=session)
+
+        rows = provider.load_market_caps(["300009.SZ", "920992.BJ"])
+
+        self.assertEqual([row["symbol"] for row in rows], ["300009.SZ", "920992.BJ"])
+        self.assertEqual(rows[0]["market_cap"], "12814000000")
+        self.assertEqual(rows[1]["market_cap"], "1237000000")
+        self.assertIn("sz300009,bj920992", session.calls[0]["url"])
+
+    def test_fallback_universe_provider_uses_market_cap_fallback_on_failure(self):
+        fallback = TencentStockUniverseProvider(session=FakeTencentSession())
+        provider = FallbackStockUniverseProvider(FailingMarketCapProvider(), fallback)
+
+        rows = provider.load_market_caps(["300009.SZ"])
+
+        self.assertEqual(rows[0]["symbol"], "300009.SZ")
+        self.assertEqual(rows[0]["market_cap"], "12814000000")
+
+    def test_fallback_universe_provider_fills_missing_market_caps(self):
+        fallback = TencentStockUniverseProvider(session=FakeTencentSession())
+        provider = FallbackStockUniverseProvider(PartialMarketCapProvider(), fallback)
+
+        rows = provider.load_market_caps(["000001.SZ", "300009.SZ"])
+
+        self.assertEqual([row["symbol"] for row in rows], ["000001.SZ", "300009.SZ"])
+        self.assertEqual(rows[0]["market_cap"], "33000000000")
+        self.assertEqual(rows[1]["market_cap"], "12814000000")
 
     def test_fallback_universe_provider_uses_fallback_on_failure(self):
         fallback = FakeUniverseProvider()

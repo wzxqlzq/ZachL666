@@ -126,17 +126,27 @@ Repeat the same command until the number of `data/offline/daily_bars/*.csv` file
 universe size. Failed symbols are appended to `data/offline/sync_failures.csv`, and existing daily
 bar files are skipped when `--skip-existing` is used.
 
+Refresh only the market-cap snapshot after daily bars have been downloaded:
+
+```powershell
+python sync_offline_data.py --market-cap-only --provider eastmoney --fallback none --market-cap-fallback tencent --skip-existing --batch-size 500 --workers 1 --market-cap-page-size 100 --request-delay 0.2 --max-retries 2
+```
+
 Weekly Sunday update:
 
 ```powershell
-python sync_offline_data.py --incremental --lookback-days 14 --provider akshare --fallback eastmoney
+.\scripts\weekly_update.ps1
 ```
 
-Run the weekly selector:
+Or run the Python entry directly:
 
 ```powershell
-python run_weekly_selection.py
+python run_weekly_update.py --provider akshare --fallback eastmoney --akshare-history-source sina --lookback-days 14 --workers 1 --request-delay 0.5 --max-retries 2 --market-cap-provider eastmoney --market-cap-fallback tencent --market-cap-page-size 100
 ```
+
+The weekly update reuses the existing offline universe, merges the latest daily bars by trade date,
+refreshes market caps through the Eastmoney -> Tencent fallback chain, and writes the weekly
+selection result to `selection_results/weekly_<date>.csv`.
 
 Offline files are stored under:
 

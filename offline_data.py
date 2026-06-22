@@ -3,7 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from models import Bar, Quote
 
@@ -45,6 +45,35 @@ class OfflineDataStore:
             return []
         with self.universe_path.open("r", encoding="utf-8-sig", newline="") as f:
             return list(csv.DictReader(f))
+
+    def update_universe_market_caps(self, rows: list[dict[str, str]]) -> int:
+        current_rows = self.load_universe()
+        if not current_rows:
+            self.save_universe(rows)
+            return sum(1 for row in rows if self._market_cap_value(row) > 0)
+
+        updates = {row.get("symbol", ""): row for row in rows if row.get("symbol")}
+        updated_count = 0
+        for current in current_rows:
+            symbol = current.get("symbol", "")
+            update = updates.get(symbol)
+            if not update:
+                continue
+            market_cap = self._market_cap_value(update)
+            if market_cap > 0:
+                current["market_cap"] = str(int(market_cap))
+                updated_count += 1
+            for field in ["name", "exchange", "status"]:
+                if not current.get(field) and update.get(field):
+                    current[field] = update[field]
+            current["updated_at"] = date.today().isoformat()
+
+        self.save_universe(current_rows)
+        return updated_count
+
+    def _market_cap_value(self, row: dict[str, str]) -> float:
+        raw = row.get("market_cap") or row.get("total_market_cap") or "0"
+        return float(str(raw).replace(",", ""))
 
     def save_bars(self, symbol: str, bars: list[Bar]) -> None:
         self.daily_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +168,8 @@ class OfflineDataSync:
         workers: int = 6,
         request_delay_seconds: float = 0.0,
         max_retries: int = 0,
+        progress_callback: Callable[[str], None] | None = None,
+        progress_interval: int = 50,
     ):
         self.store = store
         self.universe_provider = universe_provider
@@ -146,11 +177,96 @@ class OfflineDataSync:
         self.workers = workers
         self.request_delay_seconds = request_delay_seconds
         self.max_retries = max_retries
+        self.progress_callback = progress_callback
+        self.progress_interval = max(1, progress_interval)
+
+    def _progress(self, message: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(message)
 
     def sync_universe(self) -> int:
+        self._progress("[universe] loading universe")
         rows = self.universe_provider.load_universe()
         self.store.save_universe(rows)
+        self._progress(f"[universe] saved rows={len(rows)}")
         return len(rows)
+
+    def sync_market_caps(
+        self,
+        symbols: list[str] | None = None,
+        limit: int = 0,
+        skip_existing: bool = False,
+    ) -> tuple[int, list[tuple[str, str]]]:
+        rows = self.store.load_universe()
+        if rows and hasattr(self.universe_provider, "load_market_cap"):
+            selected_rows = rows
+            if skip_existing:
+                selected_rows = [row for row in selected_rows if self.store._market_cap_value(row) <= 0]
+            selected_symbols = symbols if symbols is not None else [row["symbol"] for row in selected_rows if row.get("symbol")]
+            if limit:
+                selected_symbols = selected_symbols[:limit]
+            if hasattr(self.universe_provider, "load_market_caps"):
+                return self._sync_market_cap_batches(selected_symbols)
+            failures: list[tuple[str, str]] = []
+            market_cap_rows: list[dict[str, str]] = []
+            total = len(selected_symbols)
+            self._progress(f"[market_caps] start symbols={total} workers={self.workers}")
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(self._load_market_cap_with_retry, symbol): symbol
+                    for symbol in selected_symbols
+                }
+                for completed, future in enumerate(as_completed(futures), start=1):
+                    symbol = futures[future]
+                    try:
+                        market_cap_rows.append(future.result())
+                    except Exception as exc:
+                        failures.append((symbol, str(exc)))
+                    if completed % self.progress_interval == 0 or completed == total:
+                        self._progress(
+                            "[market_caps] "
+                            f"{completed}/{total} done, rows={len(market_cap_rows)}, failures={len(failures)}, latest={symbol}"
+                        )
+            updated_count = self.store.update_universe_market_caps(market_cap_rows)
+            self._progress(f"[market_caps] saved rows={updated_count}, failures={len(failures)}")
+            return updated_count, failures
+
+        market_cap_rows = self.universe_provider.load_universe()
+        updated_count = self.store.update_universe_market_caps(market_cap_rows)
+        self._progress(f"[market_caps] saved rows={updated_count}")
+        return updated_count, []
+
+    def _sync_market_cap_batches(self, symbols: list[str]) -> tuple[int, list[tuple[str, str]]]:
+        failures: list[tuple[str, str]] = []
+        market_cap_rows: list[dict[str, str]] = []
+        batch_size = max(1, int(getattr(self.universe_provider, "page_size", 20)))
+        batches = [symbols[index : index + batch_size] for index in range(0, len(symbols), batch_size)]
+        total_batches = len(batches)
+        total_symbols = len(symbols)
+        self._progress(
+            f"[market_caps] start symbols={total_symbols} batches={total_batches} batch_size={batch_size} workers={self.workers}"
+        )
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(self._load_market_caps_with_retry, batch): batch
+                for batch in batches
+            }
+            for completed_batches, future in enumerate(as_completed(futures), start=1):
+                batch = futures[future]
+                try:
+                    market_cap_rows.extend(future.result())
+                except Exception as exc:
+                    failures.extend((symbol, str(exc)) for symbol in batch)
+                completed_symbols = min(completed_batches * batch_size, total_symbols)
+                if completed_batches % self.progress_interval == 0 or completed_batches == total_batches:
+                    self._progress(
+                        "[market_caps] "
+                        f"batches={completed_batches}/{total_batches}, symbols~={completed_symbols}/{total_symbols}, "
+                        f"rows={len(market_cap_rows)}, failures={len(failures)}"
+                    )
+        updated_count = self.store.update_universe_market_caps(market_cap_rows)
+        self._progress(f"[market_caps] saved rows={updated_count}, failures={len(failures)}")
+        return updated_count, failures
 
     def sync_bars(
         self,
@@ -159,7 +275,7 @@ class OfflineDataSync:
         skip_existing: bool = False,
     ) -> tuple[int, list[tuple[str, str]]]:
         rows = self.store.load_universe()
-        selected_symbols = symbols or [row["symbol"] for row in rows if row.get("symbol")]
+        selected_symbols = symbols if symbols is not None else [row["symbol"] for row in rows if row.get("symbol")]
         if skip_existing:
             selected_symbols = [symbol for symbol in selected_symbols if not self.store.has_bars(symbol)]
         if limit:
@@ -167,12 +283,14 @@ class OfflineDataSync:
 
         failures: list[tuple[str, str]] = []
         success_count = 0
+        total = len(selected_symbols)
+        self._progress(f"[bars] start symbols={total} workers={self.workers}")
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
             futures = {
                 executor.submit(self._load_daily_bars_with_retry, symbol): symbol
                 for symbol in selected_symbols
             }
-            for future in as_completed(futures):
+            for completed, future in enumerate(as_completed(futures), start=1):
                 symbol = futures[future]
                 try:
                     bars = future.result()
@@ -181,6 +299,11 @@ class OfflineDataSync:
                     success_count += 1
                 except Exception as exc:
                     failures.append((symbol, str(exc)))
+                if completed % self.progress_interval == 0 or completed == total:
+                    self._progress(
+                        f"[bars] {completed}/{total} done, success={success_count}, failures={len(failures)}, latest={symbol}"
+                    )
+        self._progress(f"[bars] saved symbols={success_count}, failures={len(failures)}")
         return success_count, failures
 
     def _load_daily_bars_with_retry(self, symbol: str) -> list[Bar]:
@@ -195,3 +318,29 @@ class OfflineDataSync:
                 if attempt < self.max_retries:
                     time.sleep(self.request_delay_seconds or 1.0)
         raise last_error or RuntimeError(f"Failed to load bars for {symbol}")
+
+    def _load_market_cap_with_retry(self, symbol: str) -> dict[str, str]:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            if self.request_delay_seconds and attempt == 0:
+                time.sleep(self.request_delay_seconds)
+            try:
+                return self.universe_provider.load_market_cap(symbol)
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.request_delay_seconds or 1.0)
+        raise last_error or RuntimeError(f"Failed to load market cap for {symbol}")
+
+    def _load_market_caps_with_retry(self, symbols: list[str]) -> list[dict[str, str]]:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            if self.request_delay_seconds and attempt == 0:
+                time.sleep(self.request_delay_seconds)
+            try:
+                return self.universe_provider.load_market_caps(symbols)
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.request_delay_seconds or 1.0)
+        raise last_error or RuntimeError(f"Failed to load market caps for {symbols[0]}...")
