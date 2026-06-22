@@ -1,0 +1,13 @@
+[project]
+name = "a-share-turtle-alert"
+version = "0.1.0"
+description = "A-share turtle-style trading alert framework."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "akshare>=1.16.0",
+    "requests>=2.22.0",
+]
+
+[tool.uv]
+package = false

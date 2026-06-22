@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import os
 import shutil
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -16,9 +17,41 @@ from strategy import TurtleStrategyEngine
 from trade_gateway import AlertTradeGateway
 
 
+EMAIL_ENV_OVERRIDES = {
+    "SMTP_HOST": ("smtp_host", str),
+    "SMTP_PORT": ("smtp_port", int),
+    "SMTP_USERNAME": ("username", str),
+    "SMTP_PASSWORD": ("password", str),
+    "SMTP_SENDER": ("sender", str),
+    "SMTP_RECIPIENTS": ("recipients", lambda value: [item.strip() for item in value.split(",") if item.strip()]),
+}
+
+
 def load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_dotenv(path: str = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -39,9 +72,21 @@ def ensure_local_files() -> None:
 
 
 def load_config() -> dict:
+    load_dotenv()
     defaults = load_json("config.example.json")
     local = load_json("config.json") if Path("config.json").exists() else {}
-    return deep_merge(defaults, local)
+    config = deep_merge(defaults, local)
+    apply_env_overrides(config)
+    return config
+
+
+def apply_env_overrides(config: dict) -> None:
+    email_config = config.setdefault("email", {})
+    for env_name, (config_key, parser) in EMAIL_ENV_OVERRIDES.items():
+        raw_value = os.environ.get(env_name)
+        if raw_value is None:
+            continue
+        email_config[config_key] = parser(raw_value)
 
 
 def setup_logging(log_file: str) -> None:

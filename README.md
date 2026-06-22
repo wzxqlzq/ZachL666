@@ -47,31 +47,41 @@ Each module should depend on these contracts instead of another module's concret
 
 ## Run
 
+Use `uv` to manage the local virtual environment and dependencies. Python 3.10 or newer is
+recommended.
+
 ```powershell
-cd C:\Users\wzxql\Documents\Codex\2026-06-20\new-chat-2\outputs\a_share_turtle_alert
-python main.py --once --dry-run
+uv sync
+```
+
+```powershell
+uv run python main.py --once --dry-run
 ```
 
 Dry run prints order intents without sending email or writing order CSV files.
 
-For real alerts, update `config.json` with SMTP settings, then run:
+For real alerts, copy `.env.example` to `.env`, update the SMTP values there, then run:
 
 ```powershell
-python main.py --once
+uv run python main.py --once
 ```
+
+The real `.env` file is ignored by git. Values in `.env` override the `email` section in
+`config.json`; supported keys are `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
+`SMTP_SENDER`, and comma-separated `SMTP_RECIPIENTS`.
 
 ## AKShare Data Source
 
 Install the free market data dependency:
 
 ```powershell
-python -m pip install -r requirements.txt
+uv sync
 ```
 
 Export the latest A-share universe snapshot:
 
 ```powershell
-python akshare_sync.py --universe data/stock_universe.csv
+uv run python akshare_sync.py --universe data/stock_universe.csv
 ```
 
 To use AKShare directly for daily bars and spot quotes, set `config.json`:
@@ -93,7 +103,7 @@ universe export.
 ## Test
 
 ```powershell
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 The tests use mock data and fake email sending, so they do not require network access,
@@ -107,19 +117,19 @@ of calling the market data API directly.
 Initial download:
 
 ```powershell
-python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback eastmoney
+uv run python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback eastmoney
 ```
 
 If the market-cap snapshot is unstable, initialize code/name data first:
 
 ```powershell
-python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback none --skip-market-cap
+uv run python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback none --skip-market-cap
 ```
 
 For the first full local database build, prefer resumable batches after the universe file exists:
 
 ```powershell
-python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback none --skip-market-cap --skip-universe --skip-existing --batch-size 200 --workers 1 --request-delay 1 --max-retries 2 --akshare-timeout 30 --akshare-history-source auto
+uv run python sync_offline_data.py --init --lookback-days 500 --provider akshare --fallback none --skip-market-cap --skip-universe --skip-existing --batch-size 200 --workers 1 --request-delay 1 --max-retries 2 --akshare-timeout 30 --akshare-history-source auto
 ```
 
 Repeat the same command until the number of `data/offline/daily_bars/*.csv` files is close to the
@@ -129,7 +139,7 @@ bar files are skipped when `--skip-existing` is used.
 Refresh only the market-cap snapshot after daily bars have been downloaded:
 
 ```powershell
-python sync_offline_data.py --market-cap-only --provider eastmoney --fallback none --market-cap-fallback tencent --skip-existing --batch-size 500 --workers 1 --market-cap-page-size 100 --request-delay 0.2 --max-retries 2
+uv run python sync_offline_data.py --market-cap-only --provider eastmoney --fallback none --market-cap-fallback tencent --skip-existing --batch-size 500 --workers 1 --market-cap-page-size 100 --request-delay 0.2 --max-retries 2
 ```
 
 Weekly Sunday update:
@@ -141,7 +151,7 @@ Weekly Sunday update:
 Or run the Python entry directly:
 
 ```powershell
-python run_weekly_update.py --provider akshare --fallback eastmoney --akshare-history-source sina --lookback-days 14 --workers 1 --request-delay 0.5 --max-retries 2 --market-cap-provider eastmoney --market-cap-fallback tencent --market-cap-page-size 100
+uv run python run_weekly_update.py --provider akshare --fallback eastmoney --akshare-history-source sina --lookback-days 14 --workers 1 --request-delay 0.5 --max-retries 2 --market-cap-provider eastmoney --market-cap-fallback tencent --market-cap-page-size 100
 ```
 
 The weekly update reuses the existing offline universe, merges the latest daily bars by trade date,

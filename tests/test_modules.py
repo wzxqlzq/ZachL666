@@ -11,6 +11,7 @@ TMP_ROOT = Path(__file__).resolve().parents[1] / "test_tmp"
 TMP_ROOT.mkdir(exist_ok=True)
 
 from market_data import AkshareMarketDataProvider, CsvMarketDataProvider, EastmoneyMarketDataProvider, FallbackMarketDataProvider
+from main import apply_env_overrides, load_dotenv
 from models import Bar, Position, Quote, Signal, StockCandidate
 from notifier import EmailNotifier, EmailSender
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
@@ -1075,6 +1076,59 @@ class StrategyTests(unittest.TestCase):
         signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start + timedelta(minutes=5), 7.4), position)
 
         self.assertEqual(signals[0].action, "SELL")
+
+
+class ConfigEnvTests(unittest.TestCase):
+    def test_load_dotenv_reads_values_without_overriding_existing_environment(self):
+        tmp = case_dir("dotenv")
+        env_path = tmp / ".env"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "SMTP_HOST=smtp.local",
+                    'SMTP_PASSWORD="from_file"',
+                    "SMTP_USERNAME=from_file@example.com",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"SMTP_USERNAME": "from_environment@example.com"},
+            clear=True,
+        ):
+            load_dotenv(str(env_path))
+
+            import os
+
+            self.assertEqual("smtp.local", os.environ["SMTP_HOST"])
+            self.assertEqual("from_file", os.environ["SMTP_PASSWORD"])
+            self.assertEqual("from_environment@example.com", os.environ["SMTP_USERNAME"])
+
+    def test_apply_env_overrides_updates_email_config(self):
+        config = {"email": {"smtp_host": "smtp.example.com", "recipients": ["old@example.com"]}}
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SMTP_HOST": "smtp.local",
+                "SMTP_PORT": "587",
+                "SMTP_USERNAME": "user@example.com",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_SENDER": "sender@example.com",
+                "SMTP_RECIPIENTS": "one@example.com, two@example.com",
+            },
+            clear=True,
+        ):
+            apply_env_overrides(config)
+
+        self.assertEqual("smtp.local", config["email"]["smtp_host"])
+        self.assertEqual(587, config["email"]["smtp_port"])
+        self.assertEqual("user@example.com", config["email"]["username"])
+        self.assertEqual("secret", config["email"]["password"])
+        self.assertEqual("sender@example.com", config["email"]["sender"])
+        self.assertEqual(["one@example.com", "two@example.com"], config["email"]["recipients"])
 
 
 class TradeGatewayTests(unittest.TestCase):
