@@ -1,4 +1,5 @@
 import csv
+import json
 import shutil
 import sys
 import unittest
@@ -15,6 +16,7 @@ from main import apply_env_overrides, load_dotenv
 from models import Bar, Position, Quote, Signal, StockCandidate
 from notifier import EmailNotificationService, EmailNotifier, EmailSender, SelectionReport
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
+from portfolio import PortfolioRepository
 from runner import Runner
 from run_weekly_update import run_weekly_update
 from signal_store import SignalStore
@@ -479,6 +481,22 @@ class WeeklyArgs:
 
 def make_bars(symbol="000001.SZ", count=20, high=10.0, low=8.0):
     start = date(2026, 1, 1)
+    return [
+        Bar(
+            symbol=symbol,
+            trade_date=start + timedelta(days=i),
+            open=9.0,
+            high=high,
+            low=low,
+            close=9.0,
+            volume=1000000,
+        )
+        for i in range(count)
+    ]
+
+
+def make_completed_bars(symbol="000001.SZ", count=55, high=10.0, low=8.0, end=date(2026, 1, 1)):
+    start = end - timedelta(days=count - 1)
     return [
         Bar(
             symbol=symbol,
@@ -1208,64 +1226,77 @@ class MarketDataTests(unittest.TestCase):
 
 
 class StrategyTests(unittest.TestCase):
-    def test_buy_breakout_requires_five_minute_confirmation(self):
-        strategy = TurtleStrategyEngine(20, 10, 20, 0.01, confirm_minutes=5)
+    def test_buy_breakout_fires_immediately_above_55_day_high(self):
+        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_bars()
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
         start = datetime(2026, 1, 2, 10, 0)
 
         first = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.5), Position("000001.SZ"))
-        second = strategy.on_quote(
-            candidate,
-            bars,
-            Quote("000001.SZ", start + timedelta(minutes=4), 10.6),
-            Position("000001.SZ"),
-        )
-        third = strategy.on_quote(
-            candidate,
-            bars,
-            Quote("000001.SZ", start + timedelta(minutes=5), 10.7),
-            Position("000001.SZ"),
-        )
         duplicate = strategy.on_quote(
             candidate,
             bars,
-            Quote("000001.SZ", start + timedelta(minutes=10), 10.8),
+            Quote("000001.SZ", start + timedelta(minutes=1), 10.8),
             Position("000001.SZ"),
         )
 
-        self.assertEqual(first, [])
-        self.assertEqual(second, [])
-        self.assertEqual(third[0].action, "BUY")
+        self.assertEqual(first[0].action, "BUY")
+        self.assertIn("55-day high", first[0].reason)
         self.assertEqual(duplicate, [])
 
-    def test_pending_breakout_is_cancelled_when_price_reverts(self):
-        strategy = TurtleStrategyEngine(20, 10, 20, 0.01, confirm_minutes=5)
+    def test_buy_signal_ignores_current_day_bar(self):
+        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_bars()
-        start = datetime(2026, 1, 2, 10, 0)
-
-        strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.5), Position("000001.SZ"))
-        reverted = strategy.on_quote(
-            candidate,
-            bars,
-            Quote("000001.SZ", start + timedelta(minutes=5), 9.9),
-            Position("000001.SZ"),
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars.append(
+            Bar(
+                symbol="000001.SZ",
+                trade_date=date(2026, 1, 2),
+                open=9.0,
+                high=12.0,
+                low=8.0,
+                close=11.0,
+                volume=1000000,
+            )
         )
-
-        self.assertEqual(reverted, [])
-
-    def test_sell_signal_for_existing_position(self):
-        strategy = TurtleStrategyEngine(20, 10, 20, 0.01, confirm_minutes=5)
-        candidate = StockCandidate("000001.SZ")
-        bars = make_bars(low=8.0)
         start = datetime(2026, 1, 2, 10, 0)
-        position = Position("000001.SZ", shares=100)
 
-        strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 7.5), position)
-        signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start + timedelta(minutes=5), 7.4), position)
+        signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.5), Position("000001.SZ"))
+
+        self.assertEqual(signals[0].action, "BUY")
+
+    def test_no_buy_signal_without_55_day_breakout(self):
+        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
+        candidate = StockCandidate("000001.SZ")
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        start = datetime(2026, 1, 2, 10, 0)
+
+        signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.0), Position("000001.SZ"))
+
+        self.assertEqual(signals, [])
+
+    def test_sell_signal_for_strategy_position_below_20_day_low(self):
+        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
+        candidate = StockCandidate("000001.SZ")
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        start = datetime(2026, 1, 2, 10, 0)
+        position = Position("000001.SZ", strategy_status="LONG")
+
+        signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 7.5), position)
 
         self.assertEqual(signals[0].action, "SELL")
+        self.assertIn("20-day low", signals[0].reason)
+
+    def test_no_sell_signal_without_20_day_breakdown(self):
+        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
+        candidate = StockCandidate("000001.SZ")
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        start = datetime(2026, 1, 2, 10, 0)
+        position = Position("000001.SZ", strategy_status="LONG")
+
+        signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 8.0), position)
+
+        self.assertEqual(signals, [])
 
 
 class ConfigEnvTests(unittest.TestCase):
@@ -1319,6 +1350,36 @@ class ConfigEnvTests(unittest.TestCase):
         self.assertEqual("secret", config["email"]["password"])
         self.assertEqual("sender@example.com", config["email"]["sender"])
         self.assertEqual(["one@example.com", "two@example.com"], config["email"]["recipients"])
+
+    def test_run_loop_uses_interval_between_scans(self):
+        import main as main_module
+
+        class FakeRunner:
+            portfolio_repository = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def run_once(self, as_of=None, at=None):
+                self.calls += 1
+                return 0
+
+        runner = FakeRunner()
+        sleep_calls = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            raise KeyboardInterrupt
+
+        with (
+            patch("main.prepare_runner", return_value=runner),
+            patch("main.time.sleep", side_effect=fake_sleep),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                main_module.run_loop(dry_run=True, interval_seconds=60)
+
+        self.assertEqual(runner.calls, 1)
+        self.assertEqual(sleep_calls, [60])
 
 
 class EmailNotificationTests(unittest.TestCase):
@@ -1413,6 +1474,65 @@ class TradeGatewayTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "000001.SZ")
 
 
+class PortfolioRepositoryTests(unittest.TestCase):
+    def test_portfolio_repository_loads_legacy_positions(self):
+        tmp = case_dir("portfolio_legacy")
+        path = tmp / "portfolio.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "cash": 100000,
+                    "positions": {
+                        "000001.SZ": {
+                            "shares": 0,
+                            "avg_cost": 0,
+                            "buy_date": None,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        positions = PortfolioRepository(str(path)).load_positions()
+
+        self.assertEqual(positions["000001.SZ"].strategy_status, "FLAT")
+        self.assertIsNone(positions["000001.SZ"].strategy_entry_date)
+
+    def test_portfolio_repository_applies_buy_and_sell_strategy_state(self):
+        tmp = case_dir("portfolio_strategy_state")
+        path = tmp / "portfolio.json"
+        path.write_text(
+            json.dumps({"cash": 100000, "positions": {}}),
+            encoding="utf-8",
+        )
+        repository = PortfolioRepository(str(path))
+        buy = Signal(
+            symbol="000001.SZ",
+            action="BUY",
+            trade_date=date(2026, 1, 2),
+            price=10.5,
+            reason="breakout",
+        )
+        sell = Signal(
+            symbol="000001.SZ",
+            action="SELL",
+            trade_date=date(2026, 1, 9),
+            price=8.0,
+            reason="breakdown",
+        )
+
+        bought = repository.apply_strategy_signal(buy)
+        sold = repository.apply_strategy_signal(sell)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(bought.strategy_status, "LONG")
+        self.assertEqual(bought.strategy_entry_date, date(2026, 1, 2))
+        self.assertEqual(bought.strategy_entry_price, 10.5)
+        self.assertEqual(sold.strategy_status, "FLAT")
+        self.assertEqual(raw["positions"]["000001.SZ"]["strategy_exit_date"], "2026-01-09")
+
+
 class IntegrationTests(unittest.TestCase):
     def test_runner_allows_modules_to_be_swapped(self):
         tmp = case_dir("integration")
@@ -1422,13 +1542,13 @@ class IntegrationTests(unittest.TestCase):
         runner = Runner(
             selector=FakeSelector([candidate]),
             market_data=FakeMarketData(
-                bars=make_bars(),
+                bars=make_completed_bars(count=55, high=10.0, low=8.0),
                 quotes=[
                     Quote("000001.SZ", start, 10.5),
                     Quote("000001.SZ", start + timedelta(minutes=5), 10.6),
                 ],
             ),
-            strategy=TurtleStrategyEngine(20, 10, 20, 0.01, confirm_minutes=5),
+            strategy=TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0),
             trade_gateway=AlertTradeGateway(
                 notifier=EmailNotifier(sender),
                 signal_store=SignalStore(str(tmp / "signals.json")),
@@ -1440,9 +1560,75 @@ class IntegrationTests(unittest.TestCase):
         first = runner.run_once(as_of=date(2026, 1, 2), at=start)
         second = runner.run_once(as_of=date(2026, 1, 2), at=start + timedelta(minutes=5))
 
-        self.assertEqual(first, 0)
-        self.assertEqual(second, 1)
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
         self.assertEqual(len(sender.messages), 1)
+
+    def test_runner_writes_portfolio_state_after_buy_signal(self):
+        tmp = case_dir("integration_portfolio_buy")
+        portfolio_path = tmp / "portfolio.json"
+        portfolio_path.write_text(
+            json.dumps({"cash": 100000, "positions": {}}),
+            encoding="utf-8",
+        )
+        repository = PortfolioRepository(str(portfolio_path))
+        candidate = StockCandidate("000001.SZ")
+        start = datetime(2026, 1, 2, 10, 0)
+        runner = Runner(
+            selector=FakeSelector([candidate]),
+            market_data=FakeMarketData(
+                bars=make_completed_bars(count=55, high=10.0, low=8.0),
+                quotes=[Quote("000001.SZ", start, 10.5)],
+            ),
+            strategy=TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0),
+            trade_gateway=AlertTradeGateway(
+                notifier=EmailNotifier(FakeEmailSender()),
+                signal_store=SignalStore(str(tmp / "signals.json")),
+                orders_dir=str(tmp / "orders"),
+            ),
+            positions=repository.load_positions(),
+            portfolio_repository=repository,
+        )
+
+        emitted = runner.run_once(as_of=date(2026, 1, 2), at=start)
+        positions = repository.load_positions()
+
+        self.assertEqual(emitted, 1)
+        self.assertEqual(positions["000001.SZ"].strategy_status, "LONG")
+        self.assertEqual(positions["000001.SZ"].strategy_entry_price, 10.5)
+
+    def test_runner_dry_run_does_not_write_portfolio_state(self):
+        tmp = case_dir("integration_portfolio_dry_run")
+        portfolio_path = tmp / "portfolio.json"
+        portfolio_path.write_text(
+            json.dumps({"cash": 100000, "positions": {}}),
+            encoding="utf-8",
+        )
+        repository = PortfolioRepository(str(portfolio_path))
+        candidate = StockCandidate("000001.SZ")
+        start = datetime(2026, 1, 2, 10, 0)
+        runner = Runner(
+            selector=FakeSelector([candidate]),
+            market_data=FakeMarketData(
+                bars=make_completed_bars(count=55, high=10.0, low=8.0),
+                quotes=[Quote("000001.SZ", start, 10.5)],
+            ),
+            strategy=TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0),
+            trade_gateway=AlertTradeGateway(
+                notifier=EmailNotifier(FakeEmailSender()),
+                signal_store=SignalStore(str(tmp / "signals.json")),
+                orders_dir=str(tmp / "orders"),
+                dry_run=True,
+            ),
+            positions=repository.load_positions(),
+            portfolio_repository=repository,
+        )
+
+        emitted = runner.run_once(as_of=date(2026, 1, 2), at=start)
+        positions = repository.load_positions()
+
+        self.assertEqual(emitted, 1)
+        self.assertNotIn("000001.SZ", positions)
 
 
 if __name__ == "__main__":

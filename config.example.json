@@ -19,11 +19,11 @@
     "adjust": "qfq"
   },
   "strategy": {
-    "entry_window": 20,
-    "exit_window": 10,
+    "entry_window": 55,
+    "exit_window": 20,
     "atr_window": 20,
     "risk_per_trade": 0.01,
-    "confirm_minutes": 5
+    "confirm_minutes": 0
   },
   "email": {
     "smtp_host": "smtp.example.com",

@@ -27,15 +27,22 @@ class TurtleStrategyEngine:
         quote: Quote,
         position: Position,
     ) -> list[Signal]:
-        if len(daily_bars) < max(self.entry_window, self.exit_window, self.atr_window):
+        completed_bars = sorted(
+            [bar for bar in daily_bars if bar.trade_date < quote.timestamp.date()],
+            key=lambda bar: bar.trade_date,
+        )
+        if len(completed_bars) < max(self.entry_window, self.exit_window, self.atr_window):
             return []
 
-        entry_high = max(bar.high for bar in daily_bars[-self.entry_window :])
-        exit_low = min(bar.low for bar in daily_bars[-self.exit_window :])
+        entry_high = max(bar.high for bar in completed_bars[-self.entry_window :])
+        exit_low = min(bar.low for bar in completed_bars[-self.exit_window :])
 
-        if position.shares <= 0:
+        if not self._has_strategy_position(position):
             return self._maybe_confirm_buy(candidate, quote, entry_high)
         return self._maybe_confirm_sell(candidate, quote, position, exit_low)
+
+    def _has_strategy_position(self, position: Position) -> bool:
+        return position.shares > 0 or position.strategy_status.upper() == "LONG"
 
     def _maybe_confirm_buy(self, candidate: StockCandidate, quote: Quote, entry_high: float) -> list[Signal]:
         if quote.price <= entry_high:
@@ -80,6 +87,9 @@ class TurtleStrategyEngine:
         if emitted_key in self._emitted:
             return []
 
+        if self.confirm_delay <= timedelta(0):
+            return self._emit_signal(symbol, action, quote, reason, risk_note, pending_key)
+
         first_seen = self._pending.get(pending_key)
         if first_seen is None:
             self._pending[pending_key] = quote.timestamp
@@ -88,6 +98,17 @@ class TurtleStrategyEngine:
         if quote.timestamp - first_seen < self.confirm_delay:
             return []
 
+        return self._emit_signal(symbol, action, quote, reason, risk_note, pending_key)
+
+    def _emit_signal(
+        self,
+        symbol: str,
+        action: str,
+        quote: Quote,
+        reason: str,
+        risk_note: str,
+        pending_key: tuple[str, str],
+    ) -> list[Signal]:
         signal = Signal(
             symbol=symbol,
             action=action,
@@ -97,7 +118,7 @@ class TurtleStrategyEngine:
             risk_note=risk_note,
             confirmed_at=quote.timestamp,
         )
-        self._emitted.add(emitted_key)
+        self._emitted.add(signal.key)
         self._pending.pop(pending_key, None)
         return [signal]
 

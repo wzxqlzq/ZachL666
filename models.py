@@ -38,6 +38,9 @@ class Position:
     shares: int = 0
     avg_cost: float = 0.0
     buy_date: date | None = None
+    strategy_status: str = "FLAT"
+    strategy_entry_date: date | None = None
+    strategy_entry_price: float | None = None
 
 
 @dataclass(frozen=True)

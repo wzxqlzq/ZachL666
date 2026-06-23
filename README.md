@@ -43,7 +43,8 @@ Each module should depend on these contracts instead of another module's concret
 - `RuleBasedStockSelector`: applies the A-share universe rules from `data/stock_universe.csv`.
 - `CsvMarketDataProvider`: reads daily bars from `data/sample_daily.csv` and can return a mock quote.
 - `AkshareMarketDataProvider`: reads A-share daily bars and spot quotes from AKShare.
-- `TurtleStrategyEngine`: implements turtle breakout/exit logic with a 5-minute confirmation delay.
+- `TurtleStrategyEngine`: buys immediately on a break above the previous 55-day high and sells
+  immediately on a break below the previous 20-day low.
 - `EmailNotificationService`: sends selection reports and trade signal email alerts.
 - `AlertTradeGateway`: writes `orders/orders_YYYY-MM-DD.csv` and sends trade alerts.
 
@@ -61,6 +62,12 @@ uv run python main.py --once --dry-run
 ```
 
 Dry run prints order intents without sending email or writing order CSV files.
+
+For continuous intraday scanning every 60 seconds:
+
+```powershell
+uv run python main.py --loop --interval-seconds 60
+```
 
 For real alerts, copy `.env.example` to `.env`, update the SMTP values there, then run:
 
@@ -186,6 +193,8 @@ only a fallback when explicitly configured.
   to `close * volume`, which is only a rough substitute for turnover.
 - Add a local cache if AKShare rate limits or network instability becomes an issue.
 - Keep `TurtleStrategyEngine` isolated from external APIs.
+- Strategy-triggered long/flat state is stored in `portfolio.json` separately from real share
+  counts, so manual fills can still be maintained independently.
 - Add future broker or GUI gateways by implementing `TradeGateway`; do not modify strategy code.
 
 ## Rule-Based Stock Selection

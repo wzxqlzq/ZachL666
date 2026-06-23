@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import shutil
+import time
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from market_data import AkshareMarketDataProvider, CsvMarketDataProvider, EastmoneyMarketDataProvider
@@ -131,15 +132,12 @@ def build_selector(config: dict, market_data):
     raise ValueError(f"Unsupported selector provider: {provider}")
 
 
-def run_once(dry_run: bool) -> None:
-    ensure_local_files()
-    config = load_config()
-    setup_logging(config["paths"]["log_file"])
-
+def build_runner(config: dict, dry_run: bool) -> Runner:
     market_data = build_market_data(config)
     selector = build_selector(config, market_data)
     strategy = TurtleStrategyEngine(**config["strategy"])
-    positions = PortfolioRepository(config["paths"]["portfolio"]).load_positions()
+    portfolio_repository = PortfolioRepository(config["paths"]["portfolio"])
+    positions = portfolio_repository.load_positions()
     notifier = EmailNotificationService(SmtpEmailSender(config["email"]))
     gateway = AlertTradeGateway(
         notifier=notifier,
@@ -147,23 +145,53 @@ def run_once(dry_run: bool) -> None:
         orders_dir=config["paths"]["orders_dir"],
         dry_run=dry_run,
     )
-    runner = Runner(selector, market_data, strategy, gateway, positions)
+    return Runner(selector, market_data, strategy, gateway, positions, portfolio_repository=portfolio_repository)
 
+
+def prepare_runner(dry_run: bool) -> Runner:
+    ensure_local_files()
+    config = load_config()
+    setup_logging(config["paths"]["log_file"])
+    return build_runner(config, dry_run=dry_run)
+
+
+def run_runner_once(runner: Runner) -> int:
+    if runner.portfolio_repository is not None:
+        runner.positions = runner.portfolio_repository.load_positions()
     now = datetime.now()
-    # Run twice in dry-run mode so the sample 5-minute confirmation can be observed.
-    first_count = runner.run_once(as_of=now.date(), at=now)
-    second_count = 0
-    if dry_run:
-        second_count = runner.run_once(as_of=now.date(), at=now + timedelta(minutes=5))
-    print(f"Done. Confirmed signals: {first_count + second_count}")
+    signal_count = runner.run_once(as_of=now.date(), at=now)
+    print(f"{now.isoformat(sep=' ', timespec='seconds')} Confirmed signals: {signal_count}")
+    return signal_count
+
+
+def run_once(dry_run: bool) -> None:
+    runner = prepare_runner(dry_run=dry_run)
+    signal_count = run_runner_once(runner)
+    print(f"Done. Confirmed signals: {signal_count}")
+
+
+def run_loop(dry_run: bool, interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise ValueError("--interval-seconds must be greater than 0")
+
+    runner = prepare_runner(dry_run=dry_run)
+    print(f"Starting loop. Interval: {interval_seconds}s")
+    while True:
+        run_runner_once(runner)
+        time.sleep(interval_seconds)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="run one scan and exit")
+    parser.add_argument("--loop", action="store_true", help="scan repeatedly until stopped")
+    parser.add_argument("--interval-seconds", type=int, default=60, help="loop scan interval in seconds")
     parser.add_argument("--dry-run", action="store_true", help="print order intents without sending email")
     args = parser.parse_args()
-    run_once(dry_run=args.dry_run)
+    if args.loop:
+        run_loop(dry_run=args.dry_run, interval_seconds=args.interval_seconds)
+    else:
+        run_once(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
