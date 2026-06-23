@@ -4,14 +4,14 @@ from datetime import datetime
 from pathlib import Path
 
 from models import OrderIntent, Signal
-from notifier import EmailNotifier
+from notifier import EmailNotificationService
 from signal_store import SignalStore
 
 
 class AlertTradeGateway:
     def __init__(
         self,
-        notifier: EmailNotifier,
+        notifier: EmailNotificationService,
         signal_store: SignalStore,
         orders_dir: str,
         dry_run: bool = False,
@@ -31,7 +31,7 @@ class AlertTradeGateway:
             print(intent)
         else:
             self._append_order(intent)
-            self.notifier.send_signal(signal)
+            self.notifier.send_trade_signal(signal)
             self.signal_store.mark_seen(signal)
 
         logging.info("Order intent recorded: %s", intent)

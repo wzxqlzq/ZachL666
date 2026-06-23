@@ -9,6 +9,7 @@ from pathlib import Path
 
 from market_data import FallbackMarketDataProvider
 from models import Bar
+from notifier import EmailNotificationService, SelectionReport, SmtpEmailSender
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
 from stock_selector import RuleBasedStockSelector
 from sync_offline_data import build_market_data_provider, build_universe_provider, write_failures
@@ -143,10 +144,11 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
             context=_failure_context(args, stage_batch_size=0),
         )
 
-    candidates = RuleBasedStockSelector(
+    selection_details = RuleBasedStockSelector(
         universe_csv_path=str(store.universe_path),
         market_data=OfflineMarketDataProvider(store),
-    ).select(date.today())
+    ).select_with_details(date.today())
+    candidates = selection_details.selected
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +163,18 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
                     "reason": candidate.reason,
                 }
             )
+
+    if getattr(args, "notify_selection", False):
+        notifier = build_notification_service()
+        notifier.send_selection_report(
+            SelectionReport(
+                as_of=target_trade_date,
+                output_path=output_path,
+                before_trend_filter=selection_details.before_trend_filter,
+                selected=selection_details.selected,
+                excluded_by_active_trend=selection_details.excluded_by_active_trend,
+            )
+        )
 
     return bar_count, len(bar_failures), market_cap_count, len(market_cap_failures), output_path
 
@@ -203,6 +217,7 @@ def main() -> None:
         help="only fill missing/zero market caps instead of refreshing all market caps",
     )
     parser.add_argument("--skip-market-cap-refresh", action="store_true")
+    parser.add_argument("--notify-selection", action="store_true", help="send the weekly selection report by email")
     args = parser.parse_args()
 
     log_path = Path(args.log_file) if args.log_file else _default_log_path()
@@ -228,6 +243,13 @@ def main() -> None:
 def _default_log_path() -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return Path("logs") / f"weekly_update_{stamp}.log"
+
+
+def build_notification_service() -> EmailNotificationService:
+    from main import load_config
+
+    config = load_config()
+    return EmailNotificationService(SmtpEmailSender(config["email"]))
 
 
 def _failure_context(args, stage_batch_size: int = 0) -> dict[str, object]:

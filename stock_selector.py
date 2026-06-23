@@ -1,4 +1,5 @@
 import csv
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -39,6 +40,13 @@ class CsvStockSelector:
         return status in {"suspended", "delisted", "exclude"}
 
 
+@dataclass(frozen=True)
+class StockSelectionDetails:
+    before_trend_filter: list[StockCandidate]
+    selected: list[StockCandidate]
+    excluded_by_active_trend: list[StockCandidate]
+
+
 class RuleBasedStockSelector:
     def __init__(
         self,
@@ -57,7 +65,12 @@ class RuleBasedStockSelector:
         self.min_market_cap = min_market_cap
 
     def select(self, as_of: date) -> list[StockCandidate]:
-        candidates: list[StockCandidate] = []
+        return self.select_with_details(as_of).selected
+
+    def select_with_details(self, as_of: date) -> StockSelectionDetails:
+        before_trend_filter: list[StockCandidate] = []
+        selected: list[StockCandidate] = []
+        excluded_by_active_trend: list[StockCandidate] = []
         for stock in self._load_universe():
             symbol = stock["symbol"]
             if self._is_excluded(stock):
@@ -68,15 +81,30 @@ class RuleBasedStockSelector:
                 continue
 
             bars = self.market_data.load_daily_bars(symbol, end_date=as_of)
-            if self._passes_price_and_volume_rules(bars):
-                candidates.append(
+            if not self._passes_simple_price_and_volume_rules(bars):
+                continue
+
+            candidate = StockCandidate(
+                symbol=symbol,
+                name=stock.get("name", ""),
+                reason="rule_based_turtle_universe",
+            )
+            before_trend_filter.append(candidate)
+            if self._is_waiting_for_next_breakout(bars):
+                selected.append(candidate)
+            else:
+                excluded_by_active_trend.append(
                     StockCandidate(
                         symbol=symbol,
                         name=stock.get("name", ""),
-                        reason="rule_based_turtle_universe",
+                        reason="active_turtle_trend",
                     )
                 )
-        return candidates
+        return StockSelectionDetails(
+            before_trend_filter=before_trend_filter,
+            selected=selected,
+            excluded_by_active_trend=excluded_by_active_trend,
+        )
 
     def _load_universe(self) -> list[dict[str, str]]:
         if not self.universe_csv_path.exists():
@@ -105,6 +133,9 @@ class RuleBasedStockSelector:
         return float(raw.replace(",", ""))
 
     def _passes_price_and_volume_rules(self, bars: list[Bar]) -> bool:
+        return self._passes_simple_price_and_volume_rules(bars) and self._is_waiting_for_next_breakout(bars)
+
+    def _passes_simple_price_and_volume_rules(self, bars: list[Bar]) -> bool:
         if len(bars) < 121:
             return False
 
@@ -129,6 +160,19 @@ class RuleBasedStockSelector:
                 latest.close < prev55_high,
             ]
         )
+
+    def _is_waiting_for_next_breakout(self, bars: list[Bar]) -> bool:
+        active_trend = False
+        for index, current in enumerate(bars):
+            if index >= 55:
+                previous_55_high = max(bar.high for bar in bars[index - 55 : index])
+                if current.close > previous_55_high:
+                    active_trend = True
+            if index >= 20:
+                previous_20_low = min(bar.low for bar in bars[index - 20 : index])
+                if current.close < previous_20_low:
+                    active_trend = False
+        return not active_trend
 
     def _amount(self, bar: Bar) -> float:
         return bar.amount if bar.amount is not None else bar.close * bar.volume

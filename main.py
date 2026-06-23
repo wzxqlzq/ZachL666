@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from market_data import AkshareMarketDataProvider, CsvMarketDataProvider, EastmoneyMarketDataProvider
-from notifier import EmailNotifier, SmtpEmailSender
+from notifier import EmailNotificationService, SmtpEmailSender
 from portfolio import PortfolioRepository
 from runner import Runner
 from stock_selector import CsvStockSelector, RuleBasedStockSelector
@@ -140,7 +140,7 @@ def run_once(dry_run: bool) -> None:
     selector = build_selector(config, market_data)
     strategy = TurtleStrategyEngine(**config["strategy"])
     positions = PortfolioRepository(config["paths"]["portfolio"]).load_positions()
-    notifier = EmailNotifier(SmtpEmailSender(config["email"]))
+    notifier = EmailNotificationService(SmtpEmailSender(config["email"]))
     gateway = AlertTradeGateway(
         notifier=notifier,
         signal_store=SignalStore(config["paths"]["signal_db"]),

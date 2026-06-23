@@ -13,7 +13,7 @@ TMP_ROOT.mkdir(exist_ok=True)
 from market_data import AkshareMarketDataProvider, CsvMarketDataProvider, EastmoneyMarketDataProvider, FallbackMarketDataProvider
 from main import apply_env_overrides, load_dotenv
 from models import Bar, Position, Quote, Signal, StockCandidate
-from notifier import EmailNotifier, EmailSender
+from notifier import EmailNotificationService, EmailNotifier, EmailSender, SelectionReport
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
 from runner import Runner
 from run_weekly_update import run_weekly_update
@@ -35,6 +35,14 @@ class FakeEmailSender(EmailSender):
 
     def send(self, subject: str, body: str) -> None:
         self.messages.append((subject, body))
+
+
+class FakeNotificationService:
+    def __init__(self):
+        self.selection_reports = []
+
+    def send_selection_report(self, report: SelectionReport) -> None:
+        self.selection_reports.append(report)
 
 
 class FakeSelector:
@@ -466,6 +474,7 @@ class WeeklyArgs:
     skip_up_to_date_bars = True
     skip_existing_market_cap = False
     skip_market_cap_refresh = False
+    notify_selection = False
 
 
 def make_bars(symbol="000001.SZ", count=20, high=10.0, low=8.0):
@@ -522,6 +531,68 @@ def make_selector_bars(
     return bars
 
 
+def make_selector_bars_without_prior_breakout(symbol="000001.SZ"):
+    bars = make_selector_bars(symbol)
+    anchored = []
+    for index, bar in enumerate(bars):
+        anchored.append(
+            Bar(
+                symbol=bar.symbol,
+                trade_date=bar.trade_date,
+                open=bar.open,
+                high=14.0 if index < 66 else bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+                amount=bar.amount,
+            )
+        )
+    return anchored
+
+
+def make_selector_bars_after_ended_trend(symbol="000001.SZ"):
+    start = date(2026, 1, 1)
+    bars = []
+    for index in range(180):
+        if index < 60:
+            close = 10.0
+            high = 10.5
+            low = 9.5
+        elif index < 90:
+            close = 12.0
+            high = 12.5
+            low = 11.5
+        elif index == 90:
+            close = 9.0
+            high = 9.5
+            low = 8.8
+        elif index < 130:
+            close = 10.0
+            high = 20.0 if index == 100 else 10.5
+            low = 9.5
+        elif index < 170:
+            close = 12.0
+            high = 13.1 if index == 169 else 12.5
+            low = 11.8
+        else:
+            close = 13.0
+            high = 13.5
+            low = 12.5
+        bars.append(
+            Bar(
+                symbol=symbol,
+                trade_date=start + timedelta(days=index),
+                open=close,
+                high=high,
+                low=low,
+                close=close,
+                volume=1000000,
+                amount=600_000_000,
+            )
+        )
+    return bars
+
+
 def case_dir(name: str) -> Path:
     path = TMP_ROOT / name
     if path.exists():
@@ -558,7 +629,7 @@ class StockSelectorTests(unittest.TestCase):
 
         selector = RuleBasedStockSelector(
             str(universe),
-            MapMarketData({"000001.SZ": make_selector_bars()}),
+            MapMarketData({"000001.SZ": make_selector_bars_without_prior_breakout()}),
         )
 
         result = selector.select(date(2026, 5, 1))
@@ -577,10 +648,10 @@ class StockSelectorTests(unittest.TestCase):
             encoding="utf-8",
         )
         bars = {
-            "000001.SZ": make_selector_bars("000001.SZ"),
-            "000002.SZ": make_selector_bars("000002.SZ"),
-            "430001.BJ": make_selector_bars("430001.BJ"),
-            "000003.SZ": make_selector_bars("000003.SZ"),
+            "000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ"),
+            "000002.SZ": make_selector_bars_without_prior_breakout("000002.SZ"),
+            "430001.BJ": make_selector_bars_without_prior_breakout("430001.BJ"),
+            "000003.SZ": make_selector_bars_without_prior_breakout("000003.SZ"),
         }
 
         result = RuleBasedStockSelector(str(universe), MapMarketData(bars)).select(date(2026, 5, 1))
@@ -605,6 +676,64 @@ class StockSelectorTests(unittest.TestCase):
         result = RuleBasedStockSelector(str(universe), MapMarketData(bars)).select(date(2026, 5, 1))
 
         self.assertEqual(result, [])
+
+    def test_rule_based_selector_filters_active_turtle_trend(self):
+        tmp = case_dir("rule_selector_active_trend")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,ActiveTrend,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+
+        result = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData({"000001.SZ": make_selector_bars("000001.SZ")}),
+        ).select(date(2026, 5, 1))
+
+        self.assertEqual(result, [])
+
+    def test_rule_based_selector_allows_stock_after_20_day_breakdown_ends_trend(self):
+        tmp = case_dir("rule_selector_ended_trend")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,EndedTrend,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+
+        result = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData({"000001.SZ": make_selector_bars_after_ended_trend("000001.SZ")}),
+        ).select(date(2026, 6, 30))
+
+        self.assertEqual([item.symbol for item in result], ["000001.SZ"])
+
+    def test_rule_based_selector_returns_selection_details(self):
+        tmp = case_dir("rule_selector_details")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,Waiting,SZ,30000000000,\n"
+            "000002.SZ,Active,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+        selector = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData(
+                {
+                    "000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ"),
+                    "000002.SZ": make_selector_bars("000002.SZ"),
+                }
+            ),
+        )
+
+        details = selector.select_with_details(date(2026, 5, 1))
+
+        self.assertEqual([item.symbol for item in details.before_trend_filter], ["000001.SZ", "000002.SZ"])
+        self.assertEqual([item.symbol for item in details.selected], ["000001.SZ"])
+        self.assertEqual([item.symbol for item in details.excluded_by_active_trend], ["000002.SZ"])
+        self.assertEqual(details.excluded_by_active_trend[0].reason, "active_turtle_trend")
 
 
 class MarketDataTests(unittest.TestCase):
@@ -772,7 +901,7 @@ class MarketDataTests(unittest.TestCase):
         tmp = case_dir("offline_selection")
         store = OfflineDataStore(str(tmp / "offline"))
         store.save_universe(FakeUniverseProvider().load_universe())
-        store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
+        store.save_bars("000001.SZ", make_selector_bars_without_prior_breakout("000001.SZ"))
 
         selector = RuleBasedStockSelector(
             universe_csv_path=str(store.universe_path),
@@ -812,6 +941,67 @@ class MarketDataTests(unittest.TestCase):
         self.assertTrue(output.exists())
         self.assertEqual(store.load_universe()[0]["symbol"], "000001.SZ")
         self.assertGreater(len(store.load_bars("000001.SZ")), 120)
+
+    def test_weekly_update_does_not_send_selection_email_by_default(self):
+        tmp = case_dir("weekly_update_no_notify")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        store.save_bars("000001.SZ", make_selector_bars_without_prior_breakout("000001.SZ"))
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({})),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+            patch("run_weekly_update.build_notification_service") as build_notification_service,
+        ):
+            run_weekly_update(args)
+
+        build_notification_service.assert_not_called()
+
+    def test_weekly_update_can_send_selection_email(self):
+        tmp = case_dir("weekly_update_notify")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(
+            [
+                {"symbol": "000001.SZ", "name": "Waiting", "exchange": "SZ", "market_cap": "30000000000", "status": ""},
+                {"symbol": "000002.SZ", "name": "Active", "exchange": "SZ", "market_cap": "30000000000", "status": ""},
+            ]
+        )
+        store.save_bars("000001.SZ", make_selector_bars_without_prior_breakout("000001.SZ"))
+        store.save_bars("000002.SZ", make_selector_bars("000002.SZ"))
+        notifier = FakeNotificationService()
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+        args.notify_selection = True
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({})),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+            patch("run_weekly_update.build_notification_service", return_value=notifier),
+        ):
+            run_weekly_update(args)
+
+        self.assertEqual(len(notifier.selection_reports), 1)
+        report = notifier.selection_reports[0]
+        self.assertEqual([item.symbol for item in report.before_trend_filter], ["000001.SZ", "000002.SZ"])
+        self.assertEqual([item.symbol for item in report.selected], ["000001.SZ"])
+        self.assertEqual([item.symbol for item in report.excluded_by_active_trend], ["000002.SZ"])
+        self.assertEqual(report.output_path, output)
 
     def test_weekly_update_skips_up_to_date_bars(self):
         tmp = case_dir("weekly_update_skip_latest")
@@ -1129,6 +1319,65 @@ class ConfigEnvTests(unittest.TestCase):
         self.assertEqual("secret", config["email"]["password"])
         self.assertEqual("sender@example.com", config["email"]["sender"])
         self.assertEqual(["one@example.com", "two@example.com"], config["email"]["recipients"])
+
+
+class EmailNotificationTests(unittest.TestCase):
+    def test_selection_report_email_contains_before_after_and_excluded_lists(self):
+        sender = FakeEmailSender()
+        service = EmailNotificationService(sender)
+        report = SelectionReport(
+            as_of=date(2026, 6, 22),
+            output_path=Path("selection_results/weekly_2026-06-22.csv"),
+            before_trend_filter=[
+                StockCandidate("000001.SZ", "Before"),
+                StockCandidate("000002.SZ", "Active"),
+            ],
+            selected=[StockCandidate("000001.SZ", "Before")],
+            excluded_by_active_trend=[StockCandidate("000002.SZ", "Active", "active_turtle_trend")],
+        )
+
+        service.send_selection_report(report)
+
+        subject, body = sender.messages[0]
+        self.assertIn("[Stock Selection] 2026-06-22 before=2 selected=1", subject)
+        self.assertIn("Before active trend filter: 2", body)
+        self.assertIn("Selected after active trend filter: 1", body)
+        self.assertIn("Excluded by active trend: 1", body)
+        self.assertIn("000001.SZ Before", body)
+        self.assertIn("000002.SZ Active", body)
+
+    def test_selection_report_email_handles_empty_lists(self):
+        sender = FakeEmailSender()
+        service = EmailNotificationService(sender)
+        report = SelectionReport(
+            as_of=date(2026, 6, 22),
+            output_path=Path("selection_results/weekly_2026-06-22.csv"),
+            before_trend_filter=[],
+            selected=[],
+            excluded_by_active_trend=[],
+        )
+
+        service.send_selection_report(report)
+
+        self.assertIn("(none)", sender.messages[0][1])
+
+    def test_trade_signal_email_uses_common_notification_service(self):
+        sender = FakeEmailSender()
+        service = EmailNotificationService(sender)
+        signal = Signal(
+            symbol="000001.SZ",
+            action="BUY",
+            trade_date=date(2026, 1, 2),
+            price=10.5,
+            reason="breakout",
+            risk_note="review",
+        )
+
+        service.send_trade_signal(signal)
+
+        subject, body = sender.messages[0]
+        self.assertIn("[Trading Alert] BUY 000001.SZ 2026-01-02", subject)
+        self.assertIn("Reason: breakout", body)
 
 
 class TradeGatewayTests(unittest.TestCase):

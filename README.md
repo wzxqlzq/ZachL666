@@ -12,6 +12,7 @@ The project is split into four replaceable modules:
 - Market data: outputs normalized `Bar` and `Quote` objects.
 - Strategy trigger: turns candidates, bars, quotes, and positions into `Signal` objects.
 - Trade gateway: turns confirmed signals into `OrderIntent` records and notifications.
+- Notifications: sends selection reports and confirmed trade alerts through email.
 
 `Runner` is the only orchestration layer. It wires modules together but does not contain stock
 selection, market data, strategy, or trading logic.
@@ -43,7 +44,8 @@ Each module should depend on these contracts instead of another module's concret
 - `CsvMarketDataProvider`: reads daily bars from `data/sample_daily.csv` and can return a mock quote.
 - `AkshareMarketDataProvider`: reads A-share daily bars and spot quotes from AKShare.
 - `TurtleStrategyEngine`: implements turtle breakout/exit logic with a 5-minute confirmation delay.
-- `AlertTradeGateway`: sends email and writes `orders/orders_YYYY-MM-DD.csv`.
+- `EmailNotificationService`: sends selection reports and trade signal email alerts.
+- `AlertTradeGateway`: writes `orders/orders_YYYY-MM-DD.csv` and sends trade alerts.
 
 ## Run
 
@@ -158,6 +160,11 @@ The weekly update reuses the existing offline universe, merges the latest daily 
 refreshes market caps through the Eastmoney -> Tencent fallback chain, and writes the weekly
 selection result to `selection_results/weekly_<date>.csv`.
 
+Add `--notify-selection` to send a plain-text email report after weekly selection. The report includes
+the list before active turtle trend filtering, the final selected list, and the stocks excluded
+because they are already in an active turtle trend. The command uses the same `config.json` / `.env`
+SMTP settings as trade alerts.
+
 Offline files are stored under:
 
 ```text
@@ -194,4 +201,6 @@ The implemented selector matches these rules:
 - 20-day lowest low > MA120
 - 10-day lowest low > MA50
 - close < previous 55-day highest high
+- not already in an active turtle trend: a close above the previous 55-day high starts a trend,
+  and a later close below the previous 20-day low ends it
 - total market cap > 20,000,000,000

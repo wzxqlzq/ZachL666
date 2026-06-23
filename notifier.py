@@ -1,7 +1,10 @@
 import smtplib
+from dataclasses import dataclass
+from datetime import date
 from email.message import EmailMessage
+from pathlib import Path
 
-from models import Signal
+from models import Signal, StockCandidate
 
 
 class EmailSender:
@@ -25,11 +28,20 @@ class SmtpEmailSender(EmailSender):
             smtp.send_message(msg)
 
 
-class EmailNotifier:
+@dataclass(frozen=True)
+class SelectionReport:
+    as_of: date
+    output_path: Path
+    before_trend_filter: list[StockCandidate]
+    selected: list[StockCandidate]
+    excluded_by_active_trend: list[StockCandidate]
+
+
+class EmailNotificationService:
     def __init__(self, sender: EmailSender):
         self.sender = sender
 
-    def send_signal(self, signal: Signal) -> None:
+    def send_trade_signal(self, signal: Signal) -> None:
         subject = f"[Trading Alert] {signal.action} {signal.symbol} {signal.trade_date}"
         body = "\n".join(
             [
@@ -44,3 +56,41 @@ class EmailNotifier:
             ]
         )
         self.sender.send(subject, body)
+
+    def send_signal(self, signal: Signal) -> None:
+        self.send_trade_signal(signal)
+
+    def send_selection_report(self, report: SelectionReport) -> None:
+        subject = (
+            f"[Stock Selection] {report.as_of.isoformat()} "
+            f"before={len(report.before_trend_filter)} selected={len(report.selected)}"
+        )
+        body = "\n".join(
+            [
+                f"Target trade date: {report.as_of.isoformat()}",
+                f"Output path: {report.output_path}",
+                "",
+                f"Before active trend filter: {len(report.before_trend_filter)}",
+                self._format_candidates(report.before_trend_filter),
+                "",
+                f"Selected after active trend filter: {len(report.selected)}",
+                self._format_candidates(report.selected),
+                "",
+                f"Excluded by active trend: {len(report.excluded_by_active_trend)}",
+                self._format_candidates(report.excluded_by_active_trend),
+            ]
+        )
+        self.sender.send(subject, body)
+
+    def _format_candidates(self, candidates: list[StockCandidate]) -> str:
+        if not candidates:
+            return "(none)"
+        return "\n".join(f"- {self._format_candidate(candidate)}" for candidate in candidates)
+
+    def _format_candidate(self, candidate: StockCandidate) -> str:
+        if candidate.name:
+            return f"{candidate.symbol} {candidate.name}"
+        return candidate.symbol
+
+
+EmailNotifier = EmailNotificationService
