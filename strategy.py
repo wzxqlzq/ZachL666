@@ -86,14 +86,23 @@ class TurtleStrategyEngine:
         position: Position,
         exit_low: float,
     ) -> list[Signal]:
-        if quote.price >= exit_low:
+        stop_loss = position.strategy_stop_loss
+        exit_low_triggered = quote.price < exit_low
+        stop_loss_triggered = stop_loss is not None and quote.price <= stop_loss
+        if not exit_low_triggered and not stop_loss_triggered:
             self._pending.pop((candidate.symbol, "SELL"), None)
             return []
+
+        reasons = []
+        if exit_low_triggered:
+            reasons.append(f"Breakdown below {self.exit_window}-day low {exit_low:.2f}")
+        if stop_loss_triggered:
+            reasons.append(f"Hit fixed stop loss {stop_loss:.2f}")
         return self._confirm_or_wait(
             symbol=candidate.symbol,
             action="SELL",
             quote=quote,
-            reason=f"Breakdown below {self.exit_window}-day low {exit_low:.2f}",
+            reason="; ".join(reasons),
             risk_note=f"Current position: {position.shares} shares. Confirm T+1 availability manually.",
         )
 

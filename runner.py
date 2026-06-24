@@ -1,7 +1,7 @@
 from datetime import date, datetime
 
 from interfaces import MarketDataProvider, StockSelector, StrategyEngine, TradeGateway
-from models import Position
+from models import Position, StockCandidate
 
 
 class Runner:
@@ -24,7 +24,7 @@ class Runner:
     def run_once(self, as_of: date | None = None, at: datetime | None = None) -> int:
         run_date = as_of or date.today()
         emitted = 0
-        for candidate in self.selector.select(run_date):
+        for candidate in self._scan_candidates(run_date):
             bars = self.market_data.load_daily_bars(candidate.symbol, end_date=run_date)
             quote = self.market_data.get_quote(candidate.symbol, at=at)
             position = self.positions.get(candidate.symbol, Position(symbol=candidate.symbol))
@@ -34,6 +34,28 @@ class Runner:
                     self._apply_strategy_signal(signal)
                 emitted += 1
         return emitted
+
+    def _scan_candidates(self, run_date: date) -> list[StockCandidate]:
+        candidates = list(self.selector.select(run_date))
+        seen = {candidate.symbol for candidate in candidates}
+
+        for symbol, position in self.positions.items():
+            position_symbol = position.symbol or symbol
+            if position_symbol in seen:
+                continue
+            if not self._is_active_position(position):
+                continue
+            candidates.append(
+                StockCandidate(
+                    symbol=position_symbol,
+                    reason="portfolio_position",
+                )
+            )
+            seen.add(position_symbol)
+        return candidates
+
+    def _is_active_position(self, position: Position) -> bool:
+        return position.shares > 0 or position.strategy_status.upper() == "LONG"
 
     def _apply_strategy_signal(self, signal) -> None:
         if self.portfolio_repository is not None:
@@ -50,6 +72,7 @@ class Runner:
                 strategy_status="LONG",
                 strategy_entry_date=signal.trade_date,
                 strategy_entry_price=signal.price,
+                strategy_stop_loss=signal.stop_loss,
             )
         elif signal.action == "SELL":
             self.positions[signal.symbol] = Position(
@@ -60,4 +83,5 @@ class Runner:
                 strategy_status="FLAT",
                 strategy_entry_date=current.strategy_entry_date,
                 strategy_entry_price=current.strategy_entry_price,
+                strategy_stop_loss=current.strategy_stop_loss,
             )

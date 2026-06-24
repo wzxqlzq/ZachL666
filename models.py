@@ -41,6 +41,7 @@ class Position:
     strategy_status: str = "FLAT"
     strategy_entry_date: date | None = None
     strategy_entry_price: float | None = None
+    strategy_stop_loss: float | None = None
 
 
 @dataclass(frozen=True)

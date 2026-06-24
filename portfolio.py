@@ -36,6 +36,11 @@ class PortfolioRepository:
                     if raw.get("strategy_entry_price") not in {None, ""}
                     else None
                 ),
+                strategy_stop_loss=(
+                    float(raw["strategy_stop_loss"])
+                    if raw.get("strategy_stop_loss") not in {None, ""}
+                    else None
+                ),
             )
         return positions
 
@@ -55,6 +60,7 @@ class PortfolioRepository:
             raw["strategy_status"] = "LONG"
             raw["strategy_entry_date"] = signal.trade_date.isoformat()
             raw["strategy_entry_price"] = signal.price
+            raw["strategy_stop_loss"] = signal.stop_loss
         elif signal.action == "SELL":
             raw["strategy_status"] = "FLAT"
             raw["strategy_exit_date"] = signal.trade_date.isoformat()
