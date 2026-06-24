@@ -21,7 +21,7 @@ class SmtpEmailSender(EmailSender):
         msg["Subject"] = subject
         msg["From"] = self.config["sender"]
         msg["To"] = ", ".join(self.config["recipients"])
-        msg.set_content(body)
+        msg.set_content(body, charset="utf-8")
 
         with smtplib.SMTP_SSL(self.config["smtp_host"], int(self.config["smtp_port"])) as smtp:
             smtp.login(self.config["username"], self.config["password"])
@@ -42,41 +42,56 @@ class EmailNotificationService:
         self.sender = sender
 
     def send_trade_signal(self, signal: Signal) -> None:
-        subject = f"[Trading Alert] {signal.action} {signal.symbol} {signal.trade_date}"
+        subject = f"[交易提醒] {signal.action} {signal.symbol} {signal.trade_date}"
         body = "\n".join(
-            [
-                f"Symbol: {signal.symbol}",
-                f"Action: {signal.action}",
-                f"Date: {signal.trade_date}",
-                f"Reference price: {signal.price:.2f}",
-                f"Reason: {signal.reason}",
-                f"Risk note: {signal.risk_note}",
+            self._trade_signal_lines(signal)
+            + [
                 "",
-                "This is an alert only. Review manually before placing any order.",
+                "这是一条交易提醒。下单前请人工复核价格、仓位和账户状态。",
             ]
         )
         self.sender.send(subject, body)
+
+    def _trade_signal_lines(self, signal: Signal) -> list[str]:
+        lines = [
+            f"标的: {signal.symbol}",
+            f"动作: {signal.action}",
+            f"交易日期: {signal.trade_date}",
+            f"参考价格: {signal.price:.2f}",
+            f"触发原因: {signal.reason}",
+        ]
+        if signal.suggested_shares is not None:
+            lines.extend(
+                [
+                    f"建议股数: {signal.suggested_shares}",
+                    f"参考金额: {signal.suggested_notional:.2f}",
+                    f"ATR: {signal.atr:.4f}",
+                    f"止损价: {signal.stop_loss:.4f}",
+                    f"目标风险金额: {signal.risk_amount:.2f}",
+                ]
+            )
+        return lines
 
     def send_signal(self, signal: Signal) -> None:
         self.send_trade_signal(signal)
 
     def send_selection_report(self, report: SelectionReport) -> None:
         subject = (
-            f"[Stock Selection] {report.as_of.isoformat()} "
-            f"before={len(report.before_trend_filter)} selected={len(report.selected)}"
+            f"[选股报告] {report.as_of.isoformat()} "
+            f"初筛={len(report.before_trend_filter)} 入选={len(report.selected)}"
         )
         body = "\n".join(
             [
-                f"Target trade date: {report.as_of.isoformat()}",
-                f"Output path: {report.output_path}",
+                f"目标交易日: {report.as_of.isoformat()}",
+                f"输出文件: {report.output_path}",
                 "",
-                f"Before active trend filter: {len(report.before_trend_filter)}",
+                f"趋势过滤前: {len(report.before_trend_filter)}",
                 self._format_candidates(report.before_trend_filter),
                 "",
-                f"Selected after active trend filter: {len(report.selected)}",
+                f"趋势过滤后入选: {len(report.selected)}",
                 self._format_candidates(report.selected),
                 "",
-                f"Excluded by active trend: {len(report.excluded_by_active_trend)}",
+                f"因已有海龟趋势排除: {len(report.excluded_by_active_trend)}",
                 self._format_candidates(report.excluded_by_active_trend),
             ]
         )
@@ -84,7 +99,7 @@ class EmailNotificationService:
 
     def _format_candidates(self, candidates: list[StockCandidate]) -> str:
         if not candidates:
-            return "(none)"
+            return "(无)"
         return "\n".join(f"- {self._format_candidate(candidate)}" for candidate in candidates)
 
     def _format_candidate(self, candidate: StockCandidate) -> str:

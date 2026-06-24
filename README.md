@@ -109,6 +109,20 @@ To use AKShare directly for daily bars and spot quotes, set `config.json`:
 to AKShare's `stock_zh_a_daily` Sina source. `stock_zh_a_spot_em` is used for spot quotes and stock
 universe export.
 
+## Position Sizing
+
+Buy alerts include an ATR-based position-size suggestion. The default unit size is:
+
+```text
+shares = floor((account_equity * risk_per_trade / (ATR20 * stop_atr_multiple)) / lot_size) * lot_size
+stop_loss = reference_price - stop_atr_multiple * ATR20
+```
+
+The defaults in `config.json` are `account_equity=1000000`, `risk_per_trade=0.01`,
+`lot_size=100`, and `stop_atr_multiple=2.0`. Suggested size fields are written to order CSV files
+and included in trade alert emails for manual review. With the default 2 ATR stop, the intended
+maximum loss is about 1% of account equity before slippage and execution differences.
+
 ## Test
 
 ```powershell

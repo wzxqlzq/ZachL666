@@ -17,6 +17,7 @@ from models import Bar, Position, Quote, Signal, StockCandidate
 from notifier import EmailNotificationService, EmailNotifier, EmailSender, SelectionReport
 from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataProvider
 from portfolio import PortfolioRepository
+from position_sizing import AtrPositionSizer
 from runner import Runner
 from run_weekly_update import run_weekly_update
 from signal_store import SignalStore
@@ -505,6 +506,22 @@ def make_completed_bars(symbol="000001.SZ", count=55, high=10.0, low=8.0, end=da
             high=high,
             low=low,
             close=9.0,
+            volume=1000000,
+        )
+        for i in range(count)
+    ]
+
+
+def make_atr_bars(symbol="000001.SZ", count=56, high=10.0, low=9.0, close=9.5, end=date(2026, 1, 1)):
+    start = end - timedelta(days=count - 1)
+    return [
+        Bar(
+            symbol=symbol,
+            trade_date=start + timedelta(days=i),
+            open=close,
+            high=high,
+            low=low,
+            close=close,
             volume=1000000,
         )
         for i in range(count)
@@ -1226,10 +1243,30 @@ class MarketDataTests(unittest.TestCase):
 
 
 class StrategyTests(unittest.TestCase):
+    def test_atr_position_sizer_rounds_to_a_share_lot_size(self):
+        size = AtrPositionSizer(
+            account_equity=100_000,
+            risk_per_trade=0.01,
+            lot_size=100,
+            stop_atr_multiple=2,
+        ).size(price=20.0, atr=0.8)
+
+        self.assertEqual(size.risk_amount, 1000)
+        self.assertEqual(size.shares, 600)
+        self.assertEqual(size.notional, 12000)
+        self.assertAlmostEqual(size.stop_loss, 18.4)
+
     def test_buy_breakout_fires_immediately_above_55_day_high(self):
-        strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
+        strategy = TurtleStrategyEngine(
+            55,
+            20,
+            20,
+            0.01,
+            confirm_minutes=0,
+            account_equity=100_000,
+        )
         candidate = StockCandidate("000001.SZ")
-        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars = make_atr_bars(count=56, high=10.0, low=9.0, close=9.5)
         start = datetime(2026, 1, 2, 10, 0)
 
         first = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.5), Position("000001.SZ"))
@@ -1242,19 +1279,23 @@ class StrategyTests(unittest.TestCase):
 
         self.assertEqual(first[0].action, "BUY")
         self.assertIn("55-day high", first[0].reason)
+        self.assertEqual(first[0].suggested_shares, 500)
+        self.assertEqual(first[0].suggested_notional, 5250)
+        self.assertAlmostEqual(first[0].atr, 1.0)
+        self.assertAlmostEqual(first[0].stop_loss, 8.5)
         self.assertEqual(duplicate, [])
 
     def test_buy_signal_ignores_current_day_bar(self):
         strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars = make_atr_bars(count=56, high=10.0, low=9.0, close=9.5)
         bars.append(
             Bar(
                 symbol="000001.SZ",
                 trade_date=date(2026, 1, 2),
                 open=9.0,
                 high=12.0,
-                low=8.0,
+                low=9.0,
                 close=11.0,
                 volume=1000000,
             )
@@ -1268,7 +1309,7 @@ class StrategyTests(unittest.TestCase):
     def test_no_buy_signal_without_55_day_breakout(self):
         strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars = make_atr_bars(count=56, high=10.0, low=9.0, close=9.5)
         start = datetime(2026, 1, 2, 10, 0)
 
         signals = strategy.on_quote(candidate, bars, Quote("000001.SZ", start, 10.0), Position("000001.SZ"))
@@ -1278,7 +1319,7 @@ class StrategyTests(unittest.TestCase):
     def test_sell_signal_for_strategy_position_below_20_day_low(self):
         strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars = make_atr_bars(count=56, high=10.0, low=8.0, close=9.5)
         start = datetime(2026, 1, 2, 10, 0)
         position = Position("000001.SZ", strategy_status="LONG")
 
@@ -1290,7 +1331,7 @@ class StrategyTests(unittest.TestCase):
     def test_no_sell_signal_without_20_day_breakdown(self):
         strategy = TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0)
         candidate = StockCandidate("000001.SZ")
-        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars = make_atr_bars(count=56, high=10.0, low=8.0, close=9.5)
         start = datetime(2026, 1, 2, 10, 0)
         position = Position("000001.SZ", strategy_status="LONG")
 
@@ -1400,10 +1441,10 @@ class EmailNotificationTests(unittest.TestCase):
         service.send_selection_report(report)
 
         subject, body = sender.messages[0]
-        self.assertIn("[Stock Selection] 2026-06-22 before=2 selected=1", subject)
-        self.assertIn("Before active trend filter: 2", body)
-        self.assertIn("Selected after active trend filter: 1", body)
-        self.assertIn("Excluded by active trend: 1", body)
+        self.assertIn("[选股报告] 2026-06-22 初筛=2 入选=1", subject)
+        self.assertIn("趋势过滤前: 2", body)
+        self.assertIn("趋势过滤后入选: 1", body)
+        self.assertIn("因已有海龟趋势排除: 1", body)
         self.assertIn("000001.SZ Before", body)
         self.assertIn("000002.SZ Active", body)
 
@@ -1420,7 +1461,7 @@ class EmailNotificationTests(unittest.TestCase):
 
         service.send_selection_report(report)
 
-        self.assertIn("(none)", sender.messages[0][1])
+        self.assertIn("(无)", sender.messages[0][1])
 
     def test_trade_signal_email_uses_common_notification_service(self):
         sender = FakeEmailSender()
@@ -1432,13 +1473,21 @@ class EmailNotificationTests(unittest.TestCase):
             price=10.5,
             reason="breakout",
             risk_note="review",
+            suggested_shares=1200,
+            suggested_notional=24000,
+            atr=0.8,
+            stop_loss=18.4,
+            risk_amount=1000,
         )
 
         service.send_trade_signal(signal)
 
         subject, body = sender.messages[0]
-        self.assertIn("[Trading Alert] BUY 000001.SZ 2026-01-02", subject)
-        self.assertIn("Reason: breakout", body)
+        self.assertIn("[交易提醒] BUY 000001.SZ 2026-01-02", subject)
+        self.assertIn("触发原因: breakout", body)
+        self.assertNotIn("风险提示:", body)
+        self.assertIn("建议股数: 1200", body)
+        self.assertIn("ATR: 0.8000", body)
 
 
 class TradeGatewayTests(unittest.TestCase):
@@ -1458,6 +1507,11 @@ class TradeGatewayTests(unittest.TestCase):
             reason="test",
             risk_note="review",
             confirmed_at=datetime(2026, 1, 2, 10, 5),
+            suggested_shares=1200,
+            suggested_notional=12600,
+            atr=0.8,
+            stop_loss=8.9,
+            risk_amount=1000,
         )
 
         first = gateway.submit_signal(signal)
@@ -1472,6 +1526,10 @@ class TradeGatewayTests(unittest.TestCase):
         self.assertEqual(len(sender.messages), 1)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["symbol"], "000001.SZ")
+        self.assertEqual(rows[0]["suggested_shares"], "1200")
+        self.assertEqual(rows[0]["suggested_notional"], "12600.00")
+        self.assertEqual(rows[0]["atr"], "0.8000")
+        self.assertEqual(rows[0]["stop_loss"], "8.9000")
 
 
 class PortfolioRepositoryTests(unittest.TestCase):
@@ -1542,7 +1600,7 @@ class IntegrationTests(unittest.TestCase):
         runner = Runner(
             selector=FakeSelector([candidate]),
             market_data=FakeMarketData(
-                bars=make_completed_bars(count=55, high=10.0, low=8.0),
+                bars=make_atr_bars(count=56, high=10.0, low=9.0, close=9.5),
                 quotes=[
                     Quote("000001.SZ", start, 10.5),
                     Quote("000001.SZ", start + timedelta(minutes=5), 10.6),
@@ -1577,7 +1635,7 @@ class IntegrationTests(unittest.TestCase):
         runner = Runner(
             selector=FakeSelector([candidate]),
             market_data=FakeMarketData(
-                bars=make_completed_bars(count=55, high=10.0, low=8.0),
+                bars=make_atr_bars(count=56, high=10.0, low=9.0, close=9.5),
                 quotes=[Quote("000001.SZ", start, 10.5)],
             ),
             strategy=TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0),
@@ -1610,7 +1668,7 @@ class IntegrationTests(unittest.TestCase):
         runner = Runner(
             selector=FakeSelector([candidate]),
             market_data=FakeMarketData(
-                bars=make_completed_bars(count=55, high=10.0, low=8.0),
+                bars=make_atr_bars(count=56, high=10.0, low=9.0, close=9.5),
                 quotes=[Quote("000001.SZ", start, 10.5)],
             ),
             strategy=TurtleStrategyEngine(55, 20, 20, 0.01, confirm_minutes=0),

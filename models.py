@@ -52,6 +52,11 @@ class Signal:
     reason: str
     risk_note: str = ""
     confirmed_at: datetime | None = None
+    suggested_shares: int | None = None
+    suggested_notional: float | None = None
+    atr: float | None = None
+    stop_loss: float | None = None
+    risk_amount: float | None = None
 
     @property
     def key(self) -> str:
@@ -68,3 +73,8 @@ class OrderIntent:
     reason: str
     risk_note: str
     status: str = "NEW"
+    suggested_shares: int | None = None
+    suggested_notional: float | None = None
+    atr: float | None = None
+    stop_loss: float | None = None
+    risk_amount: float | None = None

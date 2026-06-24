@@ -22,8 +22,11 @@
     "entry_window": 55,
     "exit_window": 20,
     "atr_window": 20,
+    "account_equity": 1000000,
     "risk_per_trade": 0.01,
-    "confirm_minutes": 0
+    "confirm_minutes": 0,
+    "lot_size": 100,
+    "stop_atr_multiple": 2.0
   },
   "email": {
     "smtp_host": "smtp.example.com",

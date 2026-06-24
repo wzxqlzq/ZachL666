@@ -47,6 +47,11 @@ class AlertTradeGateway:
             reason=signal.reason,
             risk_note=signal.risk_note,
             status=status,
+            suggested_shares=signal.suggested_shares,
+            suggested_notional=signal.suggested_notional,
+            atr=signal.atr,
+            stop_loss=signal.stop_loss,
+            risk_amount=signal.risk_amount,
         )
 
     def _append_order(self, intent: OrderIntent) -> None:
@@ -64,6 +69,11 @@ class AlertTradeGateway:
                     "reference_price",
                     "reason",
                     "risk_note",
+                    "suggested_shares",
+                    "suggested_notional",
+                    "atr",
+                    "stop_loss",
+                    "risk_amount",
                     "status",
                 ],
             )
@@ -78,6 +88,13 @@ class AlertTradeGateway:
                     "reference_price": f"{intent.reference_price:.2f}",
                     "reason": intent.reason,
                     "risk_note": intent.risk_note,
+                    "suggested_shares": "" if intent.suggested_shares is None else intent.suggested_shares,
+                    "suggested_notional": (
+                        "" if intent.suggested_notional is None else f"{intent.suggested_notional:.2f}"
+                    ),
+                    "atr": "" if intent.atr is None else f"{intent.atr:.4f}",
+                    "stop_loss": "" if intent.stop_loss is None else f"{intent.stop_loss:.4f}",
+                    "risk_amount": "" if intent.risk_amount is None else f"{intent.risk_amount:.2f}",
                     "status": intent.status,
                 }
             )
