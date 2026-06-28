@@ -1,13 +1,26 @@
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
+
+# Local secrets and config
 .env
-test_tmp/
+config.json
+portfolio.json
+
+# Runtime output
 logs/
 orders/
 state/
 selection_results/
+
+# Test scratch directories
+test_tmp/
+test_tmp_commit_*/
+
+# Offline data sync scratch files
 data/offline/sync_failures.csv
-config.json
-portfolio.json

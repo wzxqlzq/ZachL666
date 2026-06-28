@@ -1,4 +1,3 @@
-symbol,name,reason,status
-600000.SH,SPD Bank,manual,
-000001.SZ,Ping An Bank,manual,
-000002.SZ,ST Example,excluded,exclude
+﻿symbol,name,reason,status
+688008.SH,澜起科技,weekly_selection,
+600000.SH,,portfolio_position,
