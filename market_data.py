@@ -1,4 +1,5 @@
 import csv
+import logging
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -140,9 +141,31 @@ class AkshareMarketDataProvider:
         return sorted(bars, key=lambda item: item.trade_date)
 
     def get_quote(self, symbol: str, at: datetime | None = None) -> Quote:
-        spot = self._spot_by_symbol().get(self._plain_symbol(symbol))
+        failures: list[str] = []
+        sources = [
+            ("stock_zh_a_spot_em", self._quote_from_spot_em),
+            ("stock_zh_a_minute", self._quote_from_sina_minute),
+            ("stock_zh_a_spot", self._quote_from_sina_spot),
+            ("stock_zh_a_tick_tx_js", self._quote_from_tx_tick),
+            ("stock_individual_spot_xq", self._quote_from_xueqiu_spot),
+        ]
+        for source_name, loader in sources:
+            try:
+                quote = loader(symbol, at=at)
+                logging.info("[quote_fallback] source=%s symbol=%s succeeded", source_name, symbol)
+                return quote
+            except Exception as exc:
+                message = f"[quote_fallback] source={source_name} symbol={symbol} failed: {type(exc).__name__}: {exc}"
+                failures.append(message)
+                logging.warning(message)
+                print(message)
+        raise RuntimeError(f"All AKShare quote sources failed for {symbol}: " + " | ".join(failures))
+
+    def _quote_from_spot_em(self, symbol: str, at: datetime | None = None) -> Quote:
+        df = self.ak.stock_zh_a_spot_em()
+        spot = self._row_by_symbol(df, symbol, "代码", "symbol", "f57")
         if not spot:
-            raise ValueError(f"No AKShare spot quote found for {symbol}")
+            raise ValueError(f"No stock_zh_a_spot_em quote found for {symbol}")
         return Quote(
             symbol=symbol,
             timestamp=at or datetime.now(),
@@ -151,6 +174,66 @@ class AkshareMarketDataProvider:
             high=self._spot_price_or_none(spot, "最高", "high", "f44"),
             low=self._spot_price_or_none(spot, "最低", "low", "f45"),
             volume=int(self._float(self._value(spot, "成交量", "volume", "f47", default=0))),
+        )
+
+    def _quote_from_sina_minute(self, symbol: str, at: datetime | None = None) -> Quote:
+        df = self.ak.stock_zh_a_minute(symbol=self._sina_symbol(symbol), period="1", adjust="")
+        records = self._records(df)
+        if not records:
+            raise ValueError(f"No stock_zh_a_minute rows found for {symbol}")
+        latest = records[-1]
+        timestamp = at or self._parse_datetime(self._value(latest, "day", "datetime", "time", default=None))
+        return Quote(
+            symbol=symbol,
+            timestamp=timestamp,
+            price=self._float(self._value(latest, "close", "收盘")),
+            open=self._float_or_none(self._value(latest, "open", "开盘", default=None)),
+            high=self._float_or_none(self._value(latest, "high", "最高", default=None)),
+            low=self._float_or_none(self._value(latest, "low", "最低", default=None)),
+            volume=int(self._float(self._value(latest, "volume", "成交量", default=0))),
+        )
+
+    def _quote_from_sina_spot(self, symbol: str, at: datetime | None = None) -> Quote:
+        df = self.ak.stock_zh_a_spot()
+        spot = self._row_by_symbol(df, symbol, "代码", "symbol")
+        if not spot:
+            raise ValueError(f"No stock_zh_a_spot quote found for {symbol}")
+        return Quote(
+            symbol=symbol,
+            timestamp=at or datetime.now(),
+            price=self._spot_price(spot, "最新价", "price", "trade"),
+            open=self._spot_price_or_none(spot, "今开", "open"),
+            high=self._spot_price_or_none(spot, "最高", "high"),
+            low=self._spot_price_or_none(spot, "最低", "low"),
+            volume=int(self._float(self._value(spot, "成交量", "volume", default=0))),
+        )
+
+    def _quote_from_tx_tick(self, symbol: str, at: datetime | None = None) -> Quote:
+        df = self.ak.stock_zh_a_tick_tx_js(symbol=self._sina_symbol(symbol))
+        records = self._records(df)
+        if not records:
+            raise ValueError(f"No stock_zh_a_tick_tx_js rows found for {symbol}")
+        latest = records[-1]
+        return Quote(
+            symbol=symbol,
+            timestamp=at or datetime.now(),
+            price=self._float(self._value(latest, "成交价格", "price")),
+            volume=int(self._float(self._value(latest, "成交量", "volume", default=0))),
+        )
+
+    def _quote_from_xueqiu_spot(self, symbol: str, at: datetime | None = None) -> Quote:
+        df = self.ak.stock_individual_spot_xq(symbol=self._xueqiu_symbol(symbol), timeout=self.timeout)
+        spot = self._item_value_rows(df)
+        if not spot:
+            raise ValueError(f"No stock_individual_spot_xq quote found for {symbol}")
+        return Quote(
+            symbol=symbol,
+            timestamp=at or datetime.now(),
+            price=self._float(self._value(spot, "现价", "鐜颁环", "current", "price")),
+            open=self._float_or_none(self._value(spot, "今开", "浠婂紑", "open", default=None)),
+            high=self._float_or_none(self._value(spot, "最高", "鏈€楂?", "high", default=None)),
+            low=self._float_or_none(self._value(spot, "最低", "鏈€浣?", "low", default=None)),
+            volume=int(self._float(self._value(spot, "成交量", "鎴愪氦閲?", "volume", default=0))),
         )
 
     def load_spot_candidates(self) -> list[StockCandidate]:
@@ -191,7 +274,7 @@ class AkshareMarketDataProvider:
         if self._spot_cache is None:
             df = self.ak.stock_zh_a_spot_em()
             self._spot_cache = {
-                str(self._value(row, "代码", "symbol", "f57")): row
+                self._plain_code(str(self._value(row, "代码", "symbol", "f57"))): row
                 for row in self._records(df)
                 if self._value(row, "代码", "symbol", "f57", default=None)
             }
@@ -211,7 +294,27 @@ class AkshareMarketDataProvider:
             return f"bj{code}"
         return f"sz{code}"
 
+    def _xueqiu_symbol(self, symbol: str) -> str:
+        code = self._plain_symbol(symbol)
+        suffix = symbol.split(".")[-1].upper() if "." in symbol else ""
+        if suffix in {"SH", "SZ", "BJ"}:
+            return f"{suffix}{code}"
+        if code.startswith(("60", "68", "90", "51", "52", "58")):
+            return f"SH{code}"
+        if code.startswith(("43", "83", "87", "88", "92")):
+            return f"BJ{code}"
+        return f"SZ{code}"
+
+    def _plain_code(self, raw: str) -> str:
+        code = str(raw).strip()
+        if len(code) >= 8 and code[:2].lower() in {"sh", "sz", "bj"}:
+            return code[2:]
+        if len(code) >= 8 and code[:2].upper() in {"SH", "SZ", "BJ"}:
+            return code[2:]
+        return code
+
     def _symbol_with_suffix(self, code: str) -> str:
+        code = self._plain_code(code)
         if code.startswith(("60", "68", "90", "51", "52", "58")):
             return f"{code}.SH"
         if code.startswith(("00", "30", "20", "15", "16", "18")):
@@ -228,6 +331,23 @@ class AkshareMarketDataProvider:
         if hasattr(frame, "to_dict"):
             return frame.to_dict("records")
         return list(frame)
+
+    def _row_by_symbol(self, frame, symbol: str, *code_names: str) -> dict | None:
+        target = self._plain_symbol(symbol)
+        for row in self._records(frame):
+            raw_code = self._value(row, *code_names, default=None)
+            if raw_code is not None and self._plain_code(str(raw_code)) == target:
+                return row
+        return None
+
+    def _item_value_rows(self, frame) -> dict:
+        result = {}
+        for row in self._records(frame):
+            item = self._value(row, "item", "项目", default=None)
+            value = self._value(row, "value", "值", default=None)
+            if item is not None:
+                result[str(item)] = value
+        return result
 
     def _value(self, row: dict, *names: str, default=None):
         for name in names:
@@ -247,6 +367,23 @@ class AkshareMarketDataProvider:
         if isinstance(raw, datetime):
             return raw.date()
         return datetime.strptime(str(raw), "%Y-%m-%d").date()
+
+    def _parse_datetime(self, raw) -> datetime:
+        if isinstance(raw, datetime):
+            return raw
+        if raw is None or raw == "":
+            return datetime.now()
+        text = str(raw)
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                if fmt.startswith("%H"):
+                    now = datetime.now()
+                    return parsed.replace(year=now.year, month=now.month, day=now.day)
+                return parsed
+            except ValueError:
+                continue
+        return datetime.now()
 
     def _float(self, raw) -> float:
         if raw is None or raw == "":
@@ -301,7 +438,8 @@ class EastmoneyMarketDataProvider:
             {
                 "secid": self._secid(symbol),
                 "fields1": "f1,f2,f3,f4,f5,f6",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+                "ut": "7eea3edcaed734bea9cbfc24409ed989",
                 "klt": "101",
                 "fqt": self._fqt(),
                 "beg": start.strftime("%Y%m%d"),
@@ -330,23 +468,26 @@ class EastmoneyMarketDataProvider:
 
     def get_quote(self, symbol: str, at: datetime | None = None) -> Quote:
         payload = self._get_json(
-            "https://push2.eastmoney.com/api/qt/stock/get",
+            "https://82.push2.eastmoney.com/api/qt/ulist.np/get",
             {
-                "secid": self._secid(symbol),
-                "fields": "f43,f44,f45,f46,f47,f57,f58",
+                "secids": self._secid(symbol),
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2",
+                "invt": "2",
+                "fields": "f12,f14,f2,f5,f15,f16,f17",
             },
         )
-        data = payload.get("data") or {}
+        data = self._quote_data(payload)
         if not data:
             raise ValueError(f"No Eastmoney quote found for {symbol}")
         return Quote(
             symbol=symbol,
             timestamp=at or datetime.now(),
-            price=self._scaled_price(data.get("f43")),
-            open=self._scaled_price(data.get("f46")),
-            high=self._scaled_price(data.get("f44")),
-            low=self._scaled_price(data.get("f45")),
-            volume=int(float(data.get("f47") or 0)),
+            price=self._scaled_price(data.get("f2", data.get("f43"))),
+            open=self._scaled_price(data.get("f17", data.get("f46"))),
+            high=self._scaled_price(data.get("f15", data.get("f44"))),
+            low=self._scaled_price(data.get("f16", data.get("f45"))),
+            volume=int(float(data.get("f5", data.get("f47") or 0) or 0)),
         )
 
     def _get_json(self, url: str, params: dict[str, str]):
@@ -364,6 +505,13 @@ class EastmoneyMarketDataProvider:
                 if attempt < self.retries - 1:
                     time.sleep(self.retry_sleep_seconds)
         raise RuntimeError(f"Eastmoney request failed after {self.retries} attempts: {last_error}") from last_error
+
+    def _quote_data(self, payload: dict) -> dict:
+        data = payload.get("data") or {}
+        diff = data.get("diff")
+        if isinstance(diff, list):
+            return diff[0] if diff else {}
+        return data
 
     def _secid(self, symbol: str) -> str:
         code = symbol.split(".")[0]
@@ -403,3 +551,15 @@ class FallbackMarketDataProvider:
             if self.fallback is None:
                 raise
             return self.fallback.get_quote(symbol, at=at)
+
+
+class SplitMarketDataProvider:
+    def __init__(self, daily_bars_provider, quote_provider):
+        self.daily_bars_provider = daily_bars_provider
+        self.quote_provider = quote_provider
+
+    def load_daily_bars(self, symbol: str, end_date: date | None = None) -> list[Bar]:
+        return self.daily_bars_provider.load_daily_bars(symbol, end_date=end_date)
+
+    def get_quote(self, symbol: str, at: datetime | None = None) -> Quote:
+        return self.quote_provider.get_quote(symbol, at=at)

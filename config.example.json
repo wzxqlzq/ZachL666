@@ -13,10 +13,52 @@
     "min_market_cap": 20000000000
   },
   "market_data": {
-    "provider": "eastmoney",
+    "provider": "akshare",
     "daily_csv_path": "data/sample_daily.csv",
     "lookback_days": 220,
-    "adjust": "qfq"
+    "adjust": "qfq",
+    "timeout": 30,
+    "history_source": "auto"
+  },
+  "service": {
+    "candidate_pool_path": "data/candidates.csv",
+    "loop_sleep_seconds": 1,
+    "weekly_selection": {
+      "enabled": true,
+      "weekday": 6,
+      "time": "00:30",
+      "root": "data/offline",
+      "output_dir": "selection_results",
+      "lookback_days": 14,
+      "workers": 4,
+      "limit": 0,
+      "provider": "akshare",
+      "fallback": "eastmoney",
+      "akshare_timeout": 30,
+      "akshare_history_source": "sina",
+      "market_cap_provider": "eastmoney",
+      "market_cap_fallback": "tencent",
+      "market_cap_page_size": 100,
+      "request_delay": 0.5,
+      "max_retries": 2,
+      "update_scope": "selection",
+      "bar_worker_mode": "process",
+      "bar_workers": 4,
+      "bar_batch_size": 20,
+      "bar_timeout_seconds": 15,
+      "final_retry_provider": "eastmoney",
+      "skip_up_to_date_bars": true,
+      "skip_existing_market_cap": false,
+      "skip_market_cap_refresh": false,
+      "notify_selection": false
+    },
+    "intraday": {
+      "enabled": true,
+      "offline_root": "data/offline",
+      "quote_provider": "akshare",
+      "interval_seconds": 60,
+      "sessions": ["09:30-11:30", "13:00-15:00"]
+    }
   },
   "strategy": {
     "entry_window": 55,

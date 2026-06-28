@@ -11,7 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 TMP_ROOT = Path(__file__).resolve().parents[1] / "test_tmp"
 TMP_ROOT.mkdir(exist_ok=True)
 
-from market_data import AkshareMarketDataProvider, CsvMarketDataProvider, EastmoneyMarketDataProvider, FallbackMarketDataProvider
+from candidate_pool import CandidatePoolRepository
+from market_data import (
+    AkshareMarketDataProvider,
+    CsvMarketDataProvider,
+    EastmoneyMarketDataProvider,
+    FallbackMarketDataProvider,
+    SplitMarketDataProvider,
+)
 from main import apply_env_overrides, load_dotenv
 from models import Bar, Position, Quote, Signal, StockCandidate
 from notifier import EmailNotificationService, EmailNotifier, EmailSender, SelectionReport
@@ -20,6 +27,7 @@ from portfolio import PortfolioRepository
 from position_sizing import AtrPositionSizer
 from runner import Runner
 from run_weekly_update import run_weekly_update
+from service import ScheduledService, TradingSession, WeeklySelectionJob
 from signal_store import SignalStore
 from stock_selector import CsvStockSelector, RuleBasedStockSelector
 from strategy import TurtleStrategyEngine
@@ -243,6 +251,91 @@ class FakeAkshareHistFailDailyOkClient(FakeAkshareClient):
                     "volume": 100,
                     "amount": 950000,
                 }
+            ]
+        )
+
+
+class FakeAkshareQuoteFallbackClient(FakeAkshareClient):
+    def __init__(self, successful_source=None):
+        self.successful_source = successful_source
+        self.calls = []
+
+    def _maybe_fail(self, source):
+        self.calls.append(source)
+        if self.successful_source != source:
+            raise RuntimeError(f"{source} unavailable")
+
+    def stock_zh_a_spot_em(self):
+        self._maybe_fail("stock_zh_a_spot_em")
+        return FakeFrame(
+            [
+                {
+                    "代码": "000001",
+                    "名称": "Ping An",
+                    "最新价": 10.1,
+                    "今开": 9.9,
+                    "最高": 10.2,
+                    "最低": 9.8,
+                    "成交量": 200,
+                }
+            ]
+        )
+
+    def stock_zh_a_minute(self, symbol, period, adjust):
+        self._maybe_fail("stock_zh_a_minute")
+        self.minute_args = {"symbol": symbol, "period": period, "adjust": adjust}
+        return FakeFrame(
+            [
+                {
+                    "day": "2026-01-02 10:01:00",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.9,
+                    "close": 10.4,
+                    "volume": 300,
+                }
+            ]
+        )
+
+    def stock_zh_a_spot(self):
+        self._maybe_fail("stock_zh_a_spot")
+        return FakeFrame(
+            [
+                {
+                    "代码": "sz000001",
+                    "名称": "Ping An",
+                    "最新价": 10.3,
+                    "今开": 10.0,
+                    "最高": 10.6,
+                    "最低": 9.9,
+                    "成交量": 400,
+                }
+            ]
+        )
+
+    def stock_zh_a_tick_tx_js(self, symbol):
+        self._maybe_fail("stock_zh_a_tick_tx_js")
+        self.tick_args = {"symbol": symbol}
+        return FakeFrame(
+            [
+                {
+                    "成交时间": "10:02:00",
+                    "成交价格": 10.2,
+                    "成交量": 500,
+                }
+            ]
+        )
+
+    def stock_individual_spot_xq(self, symbol, timeout=None):
+        self._maybe_fail("stock_individual_spot_xq")
+        self.xq_args = {"symbol": symbol, "timeout": timeout}
+        return FakeFrame(
+            [
+                {"item": "现价", "value": 10.6},
+                {"item": "今开", "value": 10.0},
+                {"item": "最高", "value": 10.7},
+                {"item": "最低", "value": 9.9},
+                {"item": "成交量", "value": 600},
             ]
         )
 
@@ -771,6 +864,35 @@ class StockSelectorTests(unittest.TestCase):
         self.assertEqual(details.excluded_by_active_trend[0].reason, "active_turtle_trend")
 
 
+class CandidatePoolRepositoryTests(unittest.TestCase):
+    def test_replaces_pool_with_weekly_selection_and_active_positions(self):
+        tmp = case_dir("candidate_pool")
+        path = tmp / "candidates.csv"
+        repository = CandidatePoolRepository(str(path))
+
+        written = repository.replace_with_weekly_selection(
+            selected=[
+                StockCandidate("000001.SZ", "Ping An", "rule_based_turtle_universe"),
+                StockCandidate("000002.SZ", "Vanke", "rule_based_turtle_universe"),
+            ],
+            positions={
+                "000001.SZ": Position("000001.SZ", shares=100),
+                "600000.SH": Position("600000.SH", strategy_status="LONG"),
+                "000003.SZ": Position("000003.SZ"),
+            },
+        )
+
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = {row["symbol"]: row for row in csv.DictReader(f)}
+
+        self.assertEqual([candidate.symbol for candidate in written], ["000001.SZ", "000002.SZ", "600000.SH"])
+        self.assertEqual(rows["000001.SZ"]["reason"], "weekly_selection;portfolio_position")
+        self.assertEqual(rows["000002.SZ"]["reason"], "weekly_selection")
+        self.assertEqual(rows["600000.SH"]["reason"], "portfolio_position")
+        self.assertNotIn("000003.SZ", rows)
+        self.assertEqual(rows["000001.SZ"]["status"], "")
+
+
 class MarketDataTests(unittest.TestCase):
     def test_csv_provider_returns_standard_bars_and_quote(self):
         tmp = case_dir("market_data")
@@ -787,6 +909,28 @@ class MarketDataTests(unittest.TestCase):
 
         self.assertEqual(bars[0].symbol, "000001.SZ")
         self.assertEqual(quote.price, 9.5)
+
+    def test_split_provider_uses_offline_bars_and_realtime_quote_provider(self):
+        class QuoteProvider:
+            def __init__(self):
+                self.calls = []
+
+            def get_quote(self, symbol: str, at: datetime | None = None):
+                self.calls.append((symbol, at))
+                return Quote(symbol, at or datetime(2026, 1, 2, 10, 0), 10.5)
+
+        daily_provider = CountingMarketData({"000001.SZ": make_atr_bars()})
+        quote_provider = QuoteProvider()
+        provider = SplitMarketDataProvider(daily_provider, quote_provider)
+        at = datetime(2026, 1, 2, 10, 0)
+
+        bars = provider.load_daily_bars("000001.SZ", end_date=date(2026, 1, 2))
+        quote = provider.get_quote("000001.SZ", at=at)
+
+        self.assertEqual(daily_provider.calls, ["000001.SZ"])
+        self.assertEqual(quote_provider.calls, [("000001.SZ", at)])
+        self.assertEqual(bars[-1].symbol, "000001.SZ")
+        self.assertEqual(quote.price, 10.5)
 
     def test_csv_provider_raises_when_quote_missing(self):
         tmp = case_dir("market_data_missing")
@@ -816,6 +960,77 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "000001.SZ")
         self.assertEqual(rows[1]["symbol"], "430001.BJ")
 
+    def test_akshare_quote_falls_back_to_sina_minute_and_logs_failures(self):
+        client = FakeAkshareQuoteFallbackClient(successful_source="stock_zh_a_minute")
+        provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
+
+        with patch("builtins.print") as print_mock, patch("market_data.logging.warning") as warning_mock:
+            quote = provider.get_quote("000001.SZ", at=datetime(2026, 1, 2, 10, 1))
+
+        self.assertEqual(client.calls, ["stock_zh_a_spot_em", "stock_zh_a_minute"])
+        self.assertEqual(client.minute_args, {"symbol": "sz000001", "period": "1", "adjust": ""})
+        self.assertEqual(quote.price, 10.4)
+        self.assertEqual(quote.open, 10.0)
+        self.assertEqual(print_mock.call_count, 1)
+        self.assertEqual(warning_mock.call_count, 1)
+
+    def test_akshare_quote_falls_back_to_sina_spot(self):
+        client = FakeAkshareQuoteFallbackClient(successful_source="stock_zh_a_spot")
+        provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
+
+        quote = provider.get_quote("000001.SZ", at=datetime(2026, 1, 2, 10, 2))
+
+        self.assertEqual(client.calls, ["stock_zh_a_spot_em", "stock_zh_a_minute", "stock_zh_a_spot"])
+        self.assertEqual(quote.price, 10.3)
+        self.assertEqual(quote.high, 10.6)
+
+    def test_akshare_quote_falls_back_to_tx_tick_with_price_only(self):
+        client = FakeAkshareQuoteFallbackClient(successful_source="stock_zh_a_tick_tx_js")
+        provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
+
+        quote = provider.get_quote("000001.SZ", at=datetime(2026, 1, 2, 10, 2))
+
+        self.assertEqual(
+            client.calls,
+            ["stock_zh_a_spot_em", "stock_zh_a_minute", "stock_zh_a_spot", "stock_zh_a_tick_tx_js"],
+        )
+        self.assertEqual(client.tick_args, {"symbol": "sz000001"})
+        self.assertEqual(quote.price, 10.2)
+        self.assertIsNone(quote.open)
+        self.assertIsNone(quote.high)
+        self.assertIsNone(quote.low)
+
+    def test_akshare_quote_falls_back_to_xueqiu_spot(self):
+        client = FakeAkshareQuoteFallbackClient(successful_source="stock_individual_spot_xq")
+        provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
+
+        quote = provider.get_quote("000001.SZ", at=datetime(2026, 1, 2, 10, 2))
+
+        self.assertEqual(client.calls[-1], "stock_individual_spot_xq")
+        self.assertEqual(client.xq_args, {"symbol": "SZ000001", "timeout": 30})
+        self.assertEqual(quote.price, 10.6)
+        self.assertEqual(quote.volume, 600)
+
+    def test_akshare_quote_raises_with_all_source_failures(self):
+        client = FakeAkshareQuoteFallbackClient(successful_source=None)
+        provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
+
+        with patch("builtins.print") as print_mock, patch("market_data.logging.warning") as warning_mock:
+            with self.assertRaises(RuntimeError) as context:
+                provider.get_quote("000001.SZ", at=datetime(2026, 1, 2, 10, 2))
+
+        message = str(context.exception)
+        for source in [
+            "stock_zh_a_spot_em",
+            "stock_zh_a_minute",
+            "stock_zh_a_spot",
+            "stock_zh_a_tick_tx_js",
+            "stock_individual_spot_xq",
+        ]:
+            self.assertIn(source, message)
+        self.assertEqual(print_mock.call_count, 5)
+        self.assertEqual(warning_mock.call_count, 5)
+
     def test_akshare_provider_falls_back_to_sina_daily_history(self):
         client = FakeAkshareHistFailDailyOkClient()
         provider = AkshareMarketDataProvider(lookback_days=30, adjust="qfq", ak_client=client)
@@ -834,7 +1049,7 @@ class MarketDataTests(unittest.TestCase):
         quote = provider.get_quote("000001.SZ", at=datetime(2026, 1, 10, 10, 0))
 
         self.assertEqual(session.calls[0]["params"]["secid"], "0.000001")
-        self.assertEqual(session.calls[1]["params"]["secid"], "0.000001")
+        self.assertEqual(session.calls[1]["params"]["secids"], "0.000001")
         self.assertEqual(bars[0].amount, 950000)
         self.assertEqual(quote.price, 10.52)
         self.assertEqual(quote.open, 10.74)
@@ -1352,6 +1567,93 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signals, [])
 
 
+class ServiceTests(unittest.TestCase):
+    def test_scheduler_runs_weekly_once_and_intraday_once_per_minute(self):
+        weekly_calls = []
+        intraday_calls = []
+        service = ScheduledService(
+            weekly_job=lambda now: weekly_calls.append(now),
+            intraday_job=lambda now: intraday_calls.append(now),
+            sessions=[TradingSession.parse("09:30-11:30"), TradingSession.parse("13:00-15:00")],
+            intraday_interval_seconds=60,
+        )
+
+        service.tick(datetime(2026, 6, 28, 0, 29))
+        service.tick(datetime(2026, 6, 28, 0, 30))
+        service.tick(datetime(2026, 6, 28, 1, 0))
+        service.tick(datetime(2026, 6, 29, 9, 29))
+        service.tick(datetime(2026, 6, 29, 9, 30))
+        service.tick(datetime(2026, 6, 29, 9, 30, 30))
+        service.tick(datetime(2026, 6, 29, 9, 31))
+        service.tick(datetime(2026, 6, 29, 11, 31))
+
+        self.assertEqual([item.time() for item in weekly_calls], [datetime(2026, 6, 28, 0, 30).time()])
+        self.assertEqual(
+            [item.time() for item in intraday_calls],
+            [datetime(2026, 6, 29, 9, 30).time(), datetime(2026, 6, 29, 9, 31).time()],
+        )
+
+    def test_scheduler_logs_job_errors_without_raising(self):
+        def failing_job(now):
+            raise RuntimeError("scan failed")
+
+        service = ScheduledService(
+            weekly_job=failing_job,
+            intraday_job=failing_job,
+            sessions=[TradingSession.parse("09:30-11:30")],
+        )
+
+        with patch("builtins.print") as print_mock, patch("service.logging.exception") as exception_mock:
+            service.tick(datetime(2026, 6, 28, 0, 30))
+            service.tick(datetime(2026, 6, 29, 9, 30))
+
+        self.assertEqual(exception_mock.call_count, 2)
+        self.assertEqual(print_mock.call_count, 4)
+
+    def test_weekly_selection_job_writes_candidate_pool_from_output_and_positions(self):
+        tmp = case_dir("weekly_selection_job")
+        output_path = tmp / "weekly.csv"
+        output_path.write_text(
+            "symbol,name,reason\n"
+            "000001.SZ,Ping An,rule_based_turtle_universe\n",
+            encoding="utf-8",
+        )
+        portfolio_path = tmp / "portfolio.json"
+        portfolio_path.write_text(
+            json.dumps(
+                {
+                    "cash": 100000,
+                    "positions": {
+                        "000001.SZ": {"shares": 100, "avg_cost": 10, "buy_date": None},
+                        "600000.SH": {"shares": 0, "avg_cost": 0, "buy_date": None, "strategy_status": "LONG"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        pool_path = tmp / "candidates.csv"
+        captured_args = []
+
+        def fake_update(args):
+            captured_args.append(args)
+            return 10, 0, 20, 0, output_path
+
+        job = WeeklySelectionJob(
+            portfolio_repository=PortfolioRepository(str(portfolio_path)),
+            candidate_pool_repository=CandidatePoolRepository(str(pool_path)),
+            args_factory=lambda now: "args",
+            update_func=fake_update,
+        )
+
+        job(datetime(2026, 6, 28, 0, 30))
+
+        with pool_path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = {row["symbol"]: row for row in csv.DictReader(f)}
+        self.assertEqual(captured_args, ["args"])
+        self.assertEqual(rows["000001.SZ"]["reason"], "weekly_selection;portfolio_position")
+        self.assertEqual(rows["600000.SH"]["reason"], "portfolio_position")
+
+
 class ConfigEnvTests(unittest.TestCase):
     def test_load_dotenv_reads_values_without_overriding_existing_environment(self):
         tmp = case_dir("dotenv")
@@ -1433,6 +1735,68 @@ class ConfigEnvTests(unittest.TestCase):
 
         self.assertEqual(runner.calls, 1)
         self.assertEqual(sleep_calls, [60])
+
+    def test_build_intraday_runner_uses_candidate_pool_and_split_provider(self):
+        import main as main_module
+
+        tmp = case_dir("intraday_runner")
+        portfolio_path = tmp / "portfolio.json"
+        portfolio_path.write_text(json.dumps({"cash": 100000, "positions": {}}), encoding="utf-8")
+        candidate_path = tmp / "candidates.csv"
+        quote_provider = FakeMarketData([], [Quote("000001.SZ", datetime(2026, 1, 2, 10, 0), 10.5)])
+        config = {
+            "selector": {
+                "provider": "rule_based",
+                "csv_path": str(candidate_path),
+                "universe_csv_path": str(tmp / "universe.csv"),
+            },
+            "market_data": {
+                "provider": "akshare",
+                "daily_csv_path": str(tmp / "daily.csv"),
+                "lookback_days": 220,
+                "adjust": "qfq",
+            },
+            "service": {
+                "candidate_pool_path": str(candidate_path),
+                "intraday": {
+                    "offline_root": str(tmp / "offline"),
+                    "quote_provider": "akshare",
+                },
+            },
+            "strategy": {
+                "entry_window": 55,
+                "exit_window": 20,
+                "atr_window": 20,
+                "account_equity": 1000000,
+                "risk_per_trade": 0.01,
+                "confirm_minutes": 0,
+                "lot_size": 100,
+                "stop_atr_multiple": 2.0,
+            },
+            "email": {
+                "smtp_host": "smtp.example.com",
+                "smtp_port": 465,
+                "username": "user@example.com",
+                "password": "secret",
+                "sender": "user@example.com",
+                "recipients": ["user@example.com"],
+            },
+            "paths": {
+                "portfolio": str(portfolio_path),
+                "signal_db": str(tmp / "signals.json"),
+                "orders_dir": str(tmp / "orders"),
+                "log_file": str(tmp / "alerts.log"),
+            },
+        }
+
+        with patch("main.build_market_data", return_value=quote_provider) as build_market_data:
+            runner = main_module.build_intraday_runner(config, dry_run=True)
+
+        self.assertIsInstance(runner.selector, CsvStockSelector)
+        self.assertEqual(runner.selector.csv_path, candidate_path)
+        self.assertIsInstance(runner.market_data, SplitMarketDataProvider)
+        self.assertIs(runner.market_data.quote_provider, quote_provider)
+        self.assertEqual(build_market_data.call_args.kwargs["provider"], "akshare")
 
 
 class EmailNotificationTests(unittest.TestCase):
