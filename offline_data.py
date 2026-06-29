@@ -1,8 +1,10 @@
 import csv
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Callable, Protocol
 
 from models import Bar, Quote
@@ -46,9 +48,12 @@ class OfflineDataStore:
         with self.universe_path.open("r", encoding="utf-8-sig", newline="") as f:
             return list(csv.DictReader(f))
 
-    def update_universe_market_caps(self, rows: list[dict[str, str]]) -> int:
+    def update_universe_market_caps(self, rows: list[dict[str, str]], updated_at: date | None = None) -> int:
+        updated_at_value = (updated_at or date.today()).isoformat()
         current_rows = self.load_universe()
         if not current_rows:
+            if updated_at is not None:
+                rows = [{**row, "updated_at": updated_at_value} for row in rows]
             self.save_universe(rows)
             return sum(1 for row in rows if self._market_cap_value(row) > 0)
 
@@ -66,7 +71,7 @@ class OfflineDataStore:
             for field in ["name", "exchange", "status"]:
                 if not current.get(field) and update.get(field):
                     current[field] = update[field]
-            current["updated_at"] = date.today().isoformat()
+            current["updated_at"] = updated_at_value
 
         self.save_universe(current_rows)
         return updated_count
@@ -81,25 +86,52 @@ class OfflineDataStore:
         for bar in bars:
             merged[bar.trade_date] = bar
         path = self._bar_path(symbol)
-        with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["date", "symbol", "open", "high", "low", "close", "volume", "amount"],
-            )
-            writer.writeheader()
-            for bar in sorted(merged.values(), key=lambda item: item.trade_date):
-                writer.writerow(
-                    {
-                        "date": bar.trade_date.isoformat(),
-                        "symbol": bar.symbol,
-                        "open": f"{bar.open:.4f}",
-                        "high": f"{bar.high:.4f}",
-                        "low": f"{bar.low:.4f}",
-                        "close": f"{bar.close:.4f}",
-                        "volume": bar.volume,
-                        "amount": "" if bar.amount is None else f"{bar.amount:.2f}",
-                    }
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                "w",
+                encoding="utf-8-sig",
+                newline="",
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                temp_path = Path(f.name)
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["date", "symbol", "open", "high", "low", "close", "volume", "amount"],
                 )
+                writer.writeheader()
+                for bar in sorted(merged.values(), key=lambda item: item.trade_date):
+                    writer.writerow(
+                        {
+                            "date": bar.trade_date.isoformat(),
+                            "symbol": bar.symbol,
+                            "open": f"{bar.open:.4f}",
+                            "high": f"{bar.high:.4f}",
+                            "low": f"{bar.low:.4f}",
+                            "close": f"{bar.close:.4f}",
+                            "volume": bar.volume,
+                            "amount": "" if bar.amount is None else f"{bar.amount:.2f}",
+                        }
+                    )
+            try:
+                temp_path.replace(path)
+            except PermissionError:
+                with temp_path.open("rb") as src, path.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
     def load_bars(self, symbol: str, end_date: date | None = None) -> list[Bar]:
         path = self._bar_path(symbol)
@@ -108,22 +140,58 @@ class OfflineDataStore:
         bars: list[Bar] = []
         with path.open("r", encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
-                trade_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
-                if end_date and trade_date > end_date:
-                    continue
-                bars.append(
-                    Bar(
-                        symbol=row["symbol"],
-                        trade_date=trade_date,
-                        open=float(row["open"]),
-                        high=float(row["high"]),
-                        low=float(row["low"]),
-                        close=float(row["close"]),
-                        volume=int(float(row["volume"])),
-                        amount=float(row["amount"]) if row.get("amount") else None,
+                try:
+                    trade_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
+                    if end_date and trade_date > end_date:
+                        continue
+                    open_price = float(row["open"])
+                    high_price = float(row["high"])
+                    low_price = float(row["low"])
+                    close_price = float(row["close"])
+                    volume = int(float(row["volume"]))
+                    amount = float(row["amount"]) if row.get("amount") else None
+                    if not self._is_valid_bar(open_price, high_price, low_price, close_price, volume, amount):
+                        continue
+                    bars.append(
+                        Bar(
+                            symbol=row["symbol"],
+                            trade_date=trade_date,
+                            open=open_price,
+                            high=high_price,
+                            low=low_price,
+                            close=close_price,
+                            volume=volume,
+                            amount=amount,
+                        )
                     )
-                )
+                except (KeyError, TypeError, ValueError):
+                    continue
         return sorted(bars, key=lambda item: item.trade_date)
+
+    @staticmethod
+    def _is_valid_bar(
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        volume: int,
+        amount: float | None,
+    ) -> bool:
+        if min(open_price, high_price, low_price, close_price) <= 0:
+            return False
+        if high_price < low_price:
+            return False
+        if open_price < low_price or open_price > high_price:
+            return False
+        if close_price < low_price or close_price > high_price:
+            return False
+        if volume < 0:
+            return False
+        if amount is not None and amount < 0:
+            return False
+        if volume <= 1 and amount is None:
+            return False
+        return True
 
     def latest_bar_date(self, symbol: str) -> date | None:
         bars = self.load_bars(symbol)
@@ -196,6 +264,7 @@ class OfflineDataSync:
         symbols: list[str] | None = None,
         limit: int = 0,
         skip_existing: bool = False,
+        updated_at: date | None = None,
     ) -> tuple[int, list[tuple[str, str]]]:
         rows = self.store.load_universe()
         if rows and hasattr(self.universe_provider, "load_market_cap"):
@@ -206,7 +275,7 @@ class OfflineDataSync:
             if limit:
                 selected_symbols = selected_symbols[:limit]
             if hasattr(self.universe_provider, "load_market_caps"):
-                return self._sync_market_cap_batches(selected_symbols)
+                return self._sync_market_cap_batches(selected_symbols, updated_at=updated_at)
             failures: list[tuple[str, str]] = []
             market_cap_rows: list[dict[str, str]] = []
             total = len(selected_symbols)
@@ -225,18 +294,22 @@ class OfflineDataSync:
                     if completed % self.progress_interval == 0 or completed == total:
                         self._progress(
                             "[market_caps] "
-                            f"{completed}/{total} done, rows={len(market_cap_rows)}, failures={len(failures)}, latest={symbol}"
+                            f"{completed}/{total} done, rows={len(market_cap_rows)}, failures={len(failures)}, symbol={symbol}"
                         )
-            updated_count = self.store.update_universe_market_caps(market_cap_rows)
+            updated_count = self.store.update_universe_market_caps(market_cap_rows, updated_at=updated_at)
             self._progress(f"[market_caps] saved rows={updated_count}, failures={len(failures)}")
             return updated_count, failures
 
         market_cap_rows = self.universe_provider.load_universe()
-        updated_count = self.store.update_universe_market_caps(market_cap_rows)
+        updated_count = self.store.update_universe_market_caps(market_cap_rows, updated_at=updated_at)
         self._progress(f"[market_caps] saved rows={updated_count}")
         return updated_count, []
 
-    def _sync_market_cap_batches(self, symbols: list[str]) -> tuple[int, list[tuple[str, str]]]:
+    def _sync_market_cap_batches(
+        self,
+        symbols: list[str],
+        updated_at: date | None = None,
+    ) -> tuple[int, list[tuple[str, str]]]:
         failures: list[tuple[str, str]] = []
         market_cap_rows: list[dict[str, str]] = []
         batch_size = max(1, int(getattr(self.universe_provider, "page_size", 20)))
@@ -264,7 +337,7 @@ class OfflineDataSync:
                         f"batches={completed_batches}/{total_batches}, symbols~={completed_symbols}/{total_symbols}, "
                         f"rows={len(market_cap_rows)}, failures={len(failures)}"
                     )
-        updated_count = self.store.update_universe_market_caps(market_cap_rows)
+        updated_count = self.store.update_universe_market_caps(market_cap_rows, updated_at=updated_at)
         self._progress(f"[market_caps] saved rows={updated_count}, failures={len(failures)}")
         return updated_count, failures
 
@@ -301,7 +374,7 @@ class OfflineDataSync:
                     failures.append((symbol, str(exc)))
                 if completed % self.progress_interval == 0 or completed == total:
                     self._progress(
-                        f"[bars] {completed}/{total} done, success={success_count}, failures={len(failures)}, latest={symbol}"
+                        f"[bars] {completed}/{total} done, success={success_count}, failures={len(failures)}, symbol={symbol}"
                     )
         self._progress(f"[bars] saved symbols={success_count}, failures={len(failures)}")
         return success_count, failures

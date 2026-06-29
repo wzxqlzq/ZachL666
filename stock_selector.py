@@ -56,6 +56,7 @@ class RuleBasedStockSelector:
         min_atr_ratio: float = 0.03,
         max_atr_ratio: float = 0.07,
         min_market_cap: float = 20_000_000_000,
+        eligible_symbols: set[str] | None = None,
     ):
         self.universe_csv_path = Path(universe_csv_path)
         self.market_data = market_data
@@ -63,6 +64,7 @@ class RuleBasedStockSelector:
         self.min_atr_ratio = min_atr_ratio
         self.max_atr_ratio = max_atr_ratio
         self.min_market_cap = min_market_cap
+        self.eligible_symbols = eligible_symbols
 
     def select(self, as_of: date) -> list[StockCandidate]:
         return self.select_with_details(as_of).selected
@@ -73,6 +75,8 @@ class RuleBasedStockSelector:
         excluded_by_active_trend: list[StockCandidate] = []
         for stock in self._load_universe():
             symbol = stock["symbol"]
+            if self.eligible_symbols is not None and symbol not in self.eligible_symbols:
+                continue
             if self._is_excluded(stock):
                 continue
             if self._is_beijing(stock):
@@ -136,7 +140,7 @@ class RuleBasedStockSelector:
         return self._passes_simple_price_and_volume_rules(bars) and self._is_waiting_for_next_breakout(bars)
 
     def _passes_simple_price_and_volume_rules(self, bars: list[Bar]) -> bool:
-        if len(bars) < 121:
+        if len(bars) < 120:
             return False
 
         latest = bars[-1]
@@ -157,20 +161,22 @@ class RuleBasedStockSelector:
                 self.min_atr_ratio < atr20 / latest.close < self.max_atr_ratio,
                 low20 > ma120,
                 low10 > ma50,
-                latest.close < prev55_high,
+                latest.high < prev55_high,
             ]
         )
 
     def _is_waiting_for_next_breakout(self, bars: list[Bar]) -> bool:
         active_trend = False
         for index, current in enumerate(bars):
+            started_or_extended_today = False
             if index >= 55:
                 previous_55_high = max(bar.high for bar in bars[index - 55 : index])
-                if current.close > previous_55_high:
+                if current.high > previous_55_high:
                     active_trend = True
-            if index >= 20:
+                    started_or_extended_today = True
+            if active_trend and not started_or_extended_today and index >= 20:
                 previous_20_low = min(bar.low for bar in bars[index - 20 : index])
-                if current.close < previous_20_low:
+                if current.low < previous_20_low:
                     active_trend = False
         return not active_trend
 

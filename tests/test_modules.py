@@ -26,7 +26,11 @@ from offline_data import OfflineDataStore, OfflineDataSync, OfflineMarketDataPro
 from portfolio import PortfolioRepository
 from position_sizing import AtrPositionSizer
 from runner import Runner
-from run_weekly_update import run_weekly_update
+from run_weekly_update import (
+    _offline_bar_validation_issues,
+    _resolve_expected_trade_dates,
+    run_weekly_update,
+)
 from service import ScheduledService, TradingSession, WeeklySelectionJob
 from signal_store import SignalStore
 from stock_selector import CsvStockSelector, RuleBasedStockSelector
@@ -568,6 +572,9 @@ class WeeklyArgs:
     bar_timeout_seconds = 60
     final_retry_provider = "none"
     skip_up_to_date_bars = True
+    validate_offline_bars = True
+    validation_window = 121
+    validation_lookback_days = 260
     skip_existing_market_cap = False
     skip_market_cap_refresh = False
     notify_selection = False
@@ -659,8 +666,8 @@ def make_selector_bars(
     return bars
 
 
-def make_selector_bars_without_prior_breakout(symbol="000001.SZ"):
-    bars = make_selector_bars(symbol)
+def make_selector_bars_without_prior_breakout(symbol="000001.SZ", count=121):
+    bars = make_selector_bars(symbol, count=count)
     anchored = []
     for index, bar in enumerate(bars):
         anchored.append(
@@ -678,6 +685,38 @@ def make_selector_bars_without_prior_breakout(symbol="000001.SZ"):
     return anchored
 
 
+def make_selector_bars_with_intraday_active_trend(symbol="000001.SZ"):
+    bars = make_selector_bars_without_prior_breakout(symbol)
+    trigger = bars[100]
+    bars[100] = Bar(
+        symbol=trigger.symbol,
+        trade_date=trigger.trade_date,
+        open=trigger.open,
+        high=14.5,
+        low=trigger.low,
+        close=trigger.close,
+        volume=trigger.volume,
+        amount=trigger.amount,
+    )
+    return bars
+
+
+def append_selector_bar(bars, trade_date):
+    latest = bars[-1]
+    return bars + [
+        Bar(
+            symbol=latest.symbol,
+            trade_date=trade_date,
+            open=latest.open,
+            high=latest.high,
+            low=latest.low,
+            close=latest.close,
+            volume=latest.volume,
+            amount=latest.amount,
+        )
+    ]
+
+
 def make_selector_bars_after_ended_trend(symbol="000001.SZ"):
     start = date(2026, 1, 1)
     bars = []
@@ -691,13 +730,17 @@ def make_selector_bars_after_ended_trend(symbol="000001.SZ"):
             high = 12.5
             low = 11.5
         elif index == 90:
-            close = 9.0
-            high = 9.5
-            low = 8.8
+            close = 12.0
+            high = 12.5
+            low = 11.0
         elif index < 130:
             close = 10.0
-            high = 20.0 if index == 100 else 10.5
+            high = 20.0 if index in {100, 125} else 10.5
             low = 9.5
+        elif index == 130:
+            close = 10.0
+            high = 10.5
+            low = 9.0
         elif index < 170:
             close = 12.0
             high = 13.1 if index == 169 else 12.5
@@ -764,6 +807,65 @@ class StockSelectorTests(unittest.TestCase):
 
         self.assertEqual([item.symbol for item in result], ["000001.SZ"])
 
+    def test_rule_based_selector_accepts_120_bars_when_ma120_available(self):
+        tmp = case_dir("rule_selector_120_bars")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,Normal,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+
+        result = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData({"000001.SZ": make_selector_bars_without_prior_breakout(count=120)}),
+        ).select(date(2026, 5, 1))
+
+        self.assertEqual([item.symbol for item in result], ["000001.SZ"])
+
+    def test_rule_based_selector_rejects_119_bars(self):
+        tmp = case_dir("rule_selector_119_bars")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,ShortHistory,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+
+        result = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData({"000001.SZ": make_selector_bars_without_prior_breakout(count=119)}),
+        ).select(date(2026, 5, 1))
+
+        self.assertEqual(result, [])
+
+    def test_rule_based_selector_allows_non_contiguous_bar_dates(self):
+        tmp = case_dir("rule_selector_gapped_dates")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,Gapped,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+        bars = []
+        for index, bar in enumerate(make_selector_bars_without_prior_breakout(count=120)):
+            bars.append(
+                Bar(
+                    symbol=bar.symbol,
+                    trade_date=bar.trade_date + timedelta(days=5 if index >= 60 else 0),
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume=bar.volume,
+                    amount=bar.amount,
+                )
+            )
+
+        result = RuleBasedStockSelector(str(universe), MapMarketData({"000001.SZ": bars})).select(date(2026, 5, 1))
+
+        self.assertEqual([item.symbol for item in result], ["000001.SZ"])
+
     def test_rule_based_selector_filters_static_universe_rules(self):
         tmp = case_dir("rule_selector_static_filters")
         universe = tmp / "universe.csv"
@@ -805,6 +907,49 @@ class StockSelectorTests(unittest.TestCase):
 
         self.assertEqual(result, [])
 
+    def test_rule_based_selector_filters_latest_intraday_high_at_previous_55_high(self):
+        tmp = case_dir("rule_selector_latest_high_breakout")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,HighTouched,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+        bars = make_selector_bars_without_prior_breakout("000001.SZ")
+        latest = bars[-1]
+        bars[-1] = Bar(
+            symbol=latest.symbol,
+            trade_date=latest.trade_date,
+            open=latest.open,
+            high=14.0,
+            low=latest.low,
+            close=latest.close,
+            volume=latest.volume,
+            amount=latest.amount,
+        )
+
+        result = RuleBasedStockSelector(str(universe), MapMarketData({"000001.SZ": bars})).select(date(2026, 5, 1))
+
+        self.assertEqual(result, [])
+
+    def test_rule_based_selector_filters_intraday_high_breakout_as_active_turtle_trend(self):
+        tmp = case_dir("rule_selector_intraday_high_active_trend")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,IntradayBreakout,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+        bars = make_selector_bars_with_intraday_active_trend("000001.SZ")
+
+        details = RuleBasedStockSelector(str(universe), MapMarketData({"000001.SZ": bars})).select_with_details(
+            date(2026, 5, 1)
+        )
+
+        self.assertEqual([item.symbol for item in details.before_trend_filter], ["000001.SZ"])
+        self.assertEqual(details.selected, [])
+        self.assertEqual([item.symbol for item in details.excluded_by_active_trend], ["000001.SZ"])
+
     def test_rule_based_selector_filters_active_turtle_trend(self):
         tmp = case_dir("rule_selector_active_trend")
         universe = tmp / "universe.csv"
@@ -816,7 +961,7 @@ class StockSelectorTests(unittest.TestCase):
 
         result = RuleBasedStockSelector(
             str(universe),
-            MapMarketData({"000001.SZ": make_selector_bars("000001.SZ")}),
+            MapMarketData({"000001.SZ": make_selector_bars_with_intraday_active_trend("000001.SZ")}),
         ).select(date(2026, 5, 1))
 
         self.assertEqual(result, [])
@@ -837,6 +982,23 @@ class StockSelectorTests(unittest.TestCase):
 
         self.assertEqual([item.symbol for item in result], ["000001.SZ"])
 
+    def test_rule_based_selector_does_not_end_trend_on_breakout_day_low(self):
+        bars = make_completed_bars(count=55, high=10.0, low=8.0)
+        bars.append(
+            Bar(
+                symbol="000001.SZ",
+                trade_date=bars[-1].trade_date + timedelta(days=1),
+                open=9.0,
+                high=11.0,
+                low=7.0,
+                close=9.0,
+                volume=1000000,
+            )
+        )
+        selector = RuleBasedStockSelector("unused.csv", MapMarketData({}))
+
+        self.assertFalse(selector._is_waiting_for_next_breakout(bars))
+
     def test_rule_based_selector_returns_selection_details(self):
         tmp = case_dir("rule_selector_details")
         universe = tmp / "universe.csv"
@@ -851,7 +1013,7 @@ class StockSelectorTests(unittest.TestCase):
             MapMarketData(
                 {
                     "000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ"),
-                    "000002.SZ": make_selector_bars("000002.SZ"),
+                    "000002.SZ": make_selector_bars_with_intraday_active_trend("000002.SZ"),
                 }
             ),
         )
@@ -862,6 +1024,30 @@ class StockSelectorTests(unittest.TestCase):
         self.assertEqual([item.symbol for item in details.selected], ["000001.SZ"])
         self.assertEqual([item.symbol for item in details.excluded_by_active_trend], ["000002.SZ"])
         self.assertEqual(details.excluded_by_active_trend[0].reason, "active_turtle_trend")
+
+    def test_rule_based_selector_can_limit_to_eligible_symbols(self):
+        tmp = case_dir("rule_selector_eligible_symbols")
+        universe = tmp / "universe.csv"
+        universe.write_text(
+            "symbol,name,exchange,market_cap,status\n"
+            "000001.SZ,Filtered,SZ,30000000000,\n"
+            "000002.SZ,Eligible,SZ,30000000000,\n",
+            encoding="utf-8",
+        )
+        selector = RuleBasedStockSelector(
+            str(universe),
+            MapMarketData(
+                {
+                    "000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ"),
+                    "000002.SZ": make_selector_bars_without_prior_breakout("000002.SZ"),
+                }
+            ),
+            eligible_symbols={"000002.SZ"},
+        )
+
+        result = selector.select(date(2026, 5, 1))
+
+        self.assertEqual([item.symbol for item in result], ["000002.SZ"])
 
 
 class CandidatePoolRepositoryTests(unittest.TestCase):
@@ -951,6 +1137,7 @@ class MarketDataTests(unittest.TestCase):
         count = provider.export_stock_universe_csv(str(tmp / "stock_universe.csv"))
 
         self.assertEqual(client.hist_args["symbol"], "000001")
+        self.assertEqual(bars[0].volume, 10000)
         self.assertEqual(bars[0].amount, 950000)
         self.assertEqual(quote.price, 10.1)
         self.assertEqual(count, 2)
@@ -1039,6 +1226,7 @@ class MarketDataTests(unittest.TestCase):
 
         self.assertEqual(client.daily_args["symbol"], "sz000001")
         self.assertEqual(bars[0].symbol, "000001.SZ")
+        self.assertEqual(bars[0].volume, 100)
         self.assertEqual(bars[0].amount, 950000)
 
     def test_eastmoney_provider_maps_direct_history_and_quote(self):
@@ -1050,6 +1238,7 @@ class MarketDataTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0]["params"]["secid"], "0.000001")
         self.assertEqual(session.calls[1]["params"]["secids"], "0.000001")
+        self.assertEqual(bars[0].volume, 10000)
         self.assertEqual(bars[0].amount, 950000)
         self.assertEqual(quote.price, 10.52)
         self.assertEqual(quote.open, 10.74)
@@ -1147,6 +1336,166 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(provider.calls, ["000001.SZ"])
         self.assertEqual(store.load_universe()[1]["market_cap"], "22000000000")
 
+    def test_offline_sync_market_caps_can_use_explicit_updated_at(self):
+        tmp = case_dir("offline_market_caps_updated_at")
+        store = OfflineDataStore(str(tmp / "offline"))
+        store.save_universe(
+            [
+                {"symbol": "000001.SZ", "name": "A", "exchange": "SZ", "market_cap": "0", "status": ""},
+            ]
+        )
+        sync = OfflineDataSync(
+            store=store,
+            universe_provider=FakeMarketCapUniverseProvider(),
+            market_data_provider=CountingMarketData({}),
+            workers=1,
+        )
+
+        updated_count, failures = sync.sync_market_caps(updated_at=date(2026, 5, 1))
+
+        row = store.load_universe()[0]
+        self.assertEqual(updated_count, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(row["market_cap"], "33000000000")
+        self.assertEqual(row["updated_at"], "2026-05-01")
+
+    def test_offline_store_skips_and_repairs_malformed_and_suspicious_bar_rows(self):
+        tmp = case_dir("offline_bad_bars")
+        store = OfflineDataStore(str(tmp / "offline"))
+        store.daily_dir.mkdir(parents=True)
+        path = store.daily_dir / "000001.SZ.csv"
+        path.write_text(
+            "date,symbol,open,high,low,close,volume,amount\n"
+            "2026-05-01,000001.SZ,9.0000,10.0000,8.0000,9.5000,100,950.00\n"
+            "5779372650.00\n"
+            "2026-05-02,000001.SZ,9.5000,10.5000,9.0000,10.0000,1,\n"
+            "2026-05-02,000001.SZ,9.5000,10.5000,9.0000,10.0000,200,2000.00\n",
+            encoding="utf-8-sig",
+        )
+
+        bars = store.load_bars("000001.SZ")
+        store.save_bars("000001.SZ", [])
+        repaired = path.read_text(encoding="utf-8-sig")
+
+        self.assertEqual([bar.trade_date for bar in bars], [date(2026, 5, 1), date(2026, 5, 2)])
+        self.assertEqual(bars[-1].volume, 200)
+        self.assertNotIn("5779372650.00", repaired)
+        self.assertNotIn(",1,", repaired)
+
+    def test_offline_bar_validation_accepts_matching_tail_dates(self):
+        tmp = case_dir("offline_validation_matching_tail")
+        store = OfflineDataStore(str(tmp / "offline"))
+        bars = make_selector_bars("000001.SZ", count=130)
+        expected_dates = tuple(bar.trade_date for bar in bars[-121:])
+        store.save_bars("000001.SZ", bars)
+
+        issues = _offline_bar_validation_issues(
+            store,
+            ["000001.SZ"],
+            expected_dates,
+            expected_dates[-1],
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_offline_bar_validation_fails_missing_middle_date(self):
+        tmp = case_dir("offline_validation_missing_middle")
+        store = OfflineDataStore(str(tmp / "offline"))
+        bars = make_selector_bars("000001.SZ", count=121)
+        missing_date = bars[60].trade_date
+        store.save_bars("000001.SZ", [bar for bar in bars if bar.trade_date != missing_date])
+
+        issues = _offline_bar_validation_issues(
+            store,
+            ["000001.SZ"],
+            tuple(bar.trade_date for bar in bars),
+            bars[-1].trade_date,
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].symbol, "000001.SZ")
+        self.assertEqual(issues[0].latest, bars[-1].trade_date)
+        self.assertEqual(issues[0].missing_dates, (missing_date,))
+
+    def test_offline_bar_validation_accepts_extra_old_history(self):
+        tmp = case_dir("offline_validation_extra_old")
+        store = OfflineDataStore(str(tmp / "offline"))
+        bars = make_selector_bars("000001.SZ", count=121)
+        extra_old = [
+            Bar(
+                symbol="000001.SZ",
+                trade_date=bars[0].trade_date - timedelta(days=2),
+                open=9.0,
+                high=10.0,
+                low=8.0,
+                close=9.5,
+                volume=1000000,
+                amount=950000,
+            )
+        ]
+        store.save_bars("000001.SZ", extra_old + bars)
+
+        issues = _offline_bar_validation_issues(
+            store,
+            ["000001.SZ"],
+            tuple(bar.trade_date for bar in bars),
+            bars[-1].trade_date,
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_offline_bar_validation_treats_filtered_bad_rows_as_missing(self):
+        tmp = case_dir("offline_validation_filtered_bad_row")
+        store = OfflineDataStore(str(tmp / "offline"))
+        store.daily_dir.mkdir(parents=True)
+        path = store.daily_dir / "000001.SZ.csv"
+        path.write_text(
+            "date,symbol,open,high,low,close,volume,amount\n"
+            "2026-05-01,000001.SZ,9.0000,10.0000,8.0000,9.5000,100,950.00\n"
+            "2026-05-02,000001.SZ,9.5000,10.5000,9.0000,10.0000,1,\n",
+            encoding="utf-8-sig",
+        )
+
+        issues = _offline_bar_validation_issues(
+            store,
+            ["000001.SZ"],
+            (date(2026, 5, 1), date(2026, 5, 2)),
+            date(2026, 5, 2),
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].missing_dates, (date(2026, 5, 2),))
+
+    def test_resolve_expected_trade_dates_uses_probe_tail(self):
+        args = WeeklyArgs()
+        args.validation_window = 121
+        bars = make_selector_bars("000001.SZ", count=130)
+        provider = CountingMarketData({"000001.SZ": bars})
+
+        expected_dates = _resolve_expected_trade_dates(args, provider, bars[-1].trade_date)
+
+        self.assertEqual(len(expected_dates), 121)
+        self.assertEqual(expected_dates[0], bars[-121].trade_date)
+        self.assertEqual(expected_dates[-1], bars[-1].trade_date)
+
+    def test_resolve_expected_trade_dates_fails_when_probe_has_too_few_bars(self):
+        args = WeeklyArgs()
+        args.validation_window = 121
+        bars = make_selector_bars("000001.SZ", count=120)
+        provider = CountingMarketData({"000001.SZ": bars})
+
+        with self.assertRaisesRegex(RuntimeError, "less than required window"):
+            _resolve_expected_trade_dates(args, provider, bars[-1].trade_date)
+
+    def test_resolve_expected_trade_dates_fails_when_probe_latest_mismatches_target(self):
+        args = WeeklyArgs()
+        args.validation_window = 121
+        bars = make_selector_bars("000001.SZ", count=121)
+        provider = CountingMarketData({"000001.SZ": bars})
+
+        with self.assertRaisesRegex(RuntimeError, "does not match target trade date"):
+            _resolve_expected_trade_dates(args, provider, bars[-1].trade_date + timedelta(days=1))
+
     def test_rule_selector_can_use_offline_provider(self):
         tmp = case_dir("offline_selection")
         store = OfflineDataStore(str(tmp / "offline"))
@@ -1190,7 +1539,35 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(output_path, output)
         self.assertTrue(output.exists())
         self.assertEqual(store.load_universe()[0]["symbol"], "000001.SZ")
+        self.assertEqual(store.load_universe()[0]["updated_at"], "2026-05-01")
         self.assertGreater(len(store.load_bars("000001.SZ")), 120)
+
+    def test_weekly_update_serial_bar_sync_does_not_sleep_between_symbols(self):
+        tmp = case_dir("weekly_update_serial_no_sleep")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        store.save_bars("000001.SZ", make_selector_bars("000001.SZ", count=120))
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-01"
+        args.request_delay = 0.5
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+            patch("run_weekly_update.time.sleep") as sleep,
+        ):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 1)
+        self.assertEqual(bar_failures, 0)
+        sleep.assert_not_called()
 
     def test_weekly_update_does_not_send_selection_email_by_default(self):
         tmp = case_dir("weekly_update_no_notify")
@@ -1208,7 +1585,7 @@ class MarketDataTests(unittest.TestCase):
         args.skip_market_cap_refresh = True
 
         with (
-            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({})),
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({"000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ")})),
             patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
             patch("run_weekly_update.build_notification_service") as build_notification_service,
         ):
@@ -1228,7 +1605,7 @@ class MarketDataTests(unittest.TestCase):
             ]
         )
         store.save_bars("000001.SZ", make_selector_bars_without_prior_breakout("000001.SZ"))
-        store.save_bars("000002.SZ", make_selector_bars("000002.SZ"))
+        store.save_bars("000002.SZ", make_selector_bars_with_intraday_active_trend("000002.SZ"))
         notifier = FakeNotificationService()
 
         args = WeeklyArgs()
@@ -1240,7 +1617,7 @@ class MarketDataTests(unittest.TestCase):
         args.notify_selection = True
 
         with (
-            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({})),
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({"000001.SZ": make_selector_bars_without_prior_breakout("000001.SZ")})),
             patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
             patch("run_weekly_update.build_notification_service", return_value=notifier),
         ):
@@ -1278,7 +1655,79 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(bar_failures, 0)
         self.assertEqual(market_cap_count, 1)
         self.assertEqual(market_cap_failures, 0)
-        self.assertEqual(market_data.calls, [])
+        self.assertEqual(market_data.calls, ["000001.SZ"])
+
+    def test_weekly_update_syncs_bars_when_validation_finds_missing_middle_date(self):
+        tmp = case_dir("weekly_update_validation_syncs_missing_middle")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        complete_bars = make_selector_bars_without_prior_breakout("000001.SZ")
+        missing_date = complete_bars[60].trade_date
+        store.save_bars("000001.SZ", [bar for bar in complete_bars if bar.trade_date != missing_date])
+        market_data = CountingMarketData({"000001.SZ": complete_bars})
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = complete_bars[-1].trade_date.isoformat()
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=market_data),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 1)
+        self.assertEqual(bar_failures, 0)
+        self.assertEqual(market_data.calls, ["000001.SZ", "000001.SZ"])
+        self.assertEqual(
+            _offline_bar_validation_issues(
+                store,
+                ["000001.SZ"],
+                tuple(bar.trade_date for bar in complete_bars),
+                complete_bars[-1].trade_date,
+            ),
+            [],
+        )
+        self.assertTrue(output.exists())
+
+    def test_weekly_update_writes_output_when_validation_still_missing_after_sync(self):
+        tmp = case_dir("weekly_update_validation_does_not_block_after_sync")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        complete_bars = make_selector_bars_without_prior_breakout("000001.SZ")
+        missing_date = complete_bars[60].trade_date
+        incomplete_bars = [bar for bar in complete_bars if bar.trade_date != missing_date]
+        store.save_bars("000001.SZ", incomplete_bars)
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = complete_bars[-1].trade_date.isoformat()
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+
+        providers = [
+            CountingMarketData({"000001.SZ": complete_bars}),
+            CountingMarketData({"000001.SZ": complete_bars}),
+            CountingMarketData({"000001.SZ": incomplete_bars}),
+        ]
+        with (
+            patch("run_weekly_update.build_market_data_provider", side_effect=providers),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        self.assertEqual(bar_count, 1)
+        self.assertEqual(bar_failures, 0)
+        self.assertTrue(output.exists())
+        self.assertFalse(Path(args.failures_csv).exists())
 
     def test_weekly_update_skips_fresh_market_caps(self):
         tmp = case_dir("weekly_update_skip_market_caps")
@@ -1317,14 +1766,15 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(market_cap_failures, 0)
         self.assertEqual(market_caps.calls, [])
 
-    def test_weekly_update_auto_target_uses_local_majority_date(self):
-        tmp = case_dir("weekly_update_local_target")
+    def test_weekly_update_auto_target_uses_provider_latest_date(self):
+        tmp = case_dir("weekly_update_provider_target")
         root = tmp / "offline"
         output = tmp / "weekly.csv"
         store = OfflineDataStore(str(root))
         store.save_universe(FakeUniverseProvider().load_universe())
         store.save_bars("000001.SZ", make_selector_bars("000001.SZ"))
-        market_data = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
+        fresh_bars = append_selector_bar(make_selector_bars("000001.SZ"), date(2026, 5, 2))
+        market_data = CountingMarketData({"000001.SZ": fresh_bars})
 
         args = WeeklyArgs()
         args.root = str(root)
@@ -1338,9 +1788,59 @@ class MarketDataTests(unittest.TestCase):
         ):
             bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
 
-        self.assertEqual(bar_count, 0)
+        self.assertEqual(bar_count, 1)
         self.assertEqual(bar_failures, 0)
-        self.assertEqual(market_data.calls, [])
+        self.assertEqual(market_data.calls, ["000001.SZ", "000001.SZ", "000001.SZ"])
+        self.assertEqual(store.latest_bar_date("000001.SZ"), date(2026, 5, 2))
+
+    def test_weekly_update_auto_target_fails_without_probe_bars(self):
+        tmp = case_dir("weekly_update_auto_target_no_probe")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "auto"
+        args.failures_csv = str(tmp / "failures.csv")
+
+        with (
+            patch("run_weekly_update.build_market_data_provider", return_value=CountingMarketData({})),
+            patch("run_weekly_update.build_universe_provider", return_value=FakeMarketCapUniverseProvider()),
+        ):
+            with self.assertRaises(RuntimeError):
+                run_weekly_update(args)
+
+        self.assertFalse(output.exists())
+
+    def test_weekly_update_excludes_symbols_stale_after_bar_sync(self):
+        tmp = case_dir("weekly_update_excludes_stale_after_sync")
+        root = tmp / "offline"
+        output = tmp / "weekly.csv"
+        store = OfflineDataStore(str(root))
+        store.save_universe(FakeUniverseProvider().load_universe())
+        stale_bars = make_selector_bars_without_prior_breakout("000001.SZ")
+        store.save_bars("000001.SZ", stale_bars)
+        market_data = CountingMarketData({"000001.SZ": stale_bars})
+
+        args = WeeklyArgs()
+        args.root = str(root)
+        args.output = str(output)
+        args.target_date = "2026-05-02"
+        args.failures_csv = str(tmp / "failures.csv")
+        args.skip_market_cap_refresh = True
+        args.validate_offline_bars = False
+
+        with patch("run_weekly_update.build_market_data_provider", return_value=market_data):
+            bar_count, bar_failures, _market_cap_count, _market_cap_failures, _ = run_weekly_update(args)
+
+        with output.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(bar_count, 0)
+        self.assertEqual(bar_failures, 1)
+        self.assertEqual(rows, [])
 
     def test_weekly_update_selection_scope_filters_static_and_market_cap_rules(self):
         tmp = case_dir("weekly_update_selection_scope")
@@ -1369,7 +1869,7 @@ class MarketDataTests(unittest.TestCase):
 
         self.assertEqual(bar_count, 1)
         self.assertEqual(bar_failures, 0)
-        self.assertEqual(market_data.calls, ["000001.SZ"])
+        self.assertEqual(market_data.calls, ["000001.SZ", "000001.SZ"])
 
     def test_fallback_market_data_provider_uses_fallback_on_failure(self):
         fallback = CountingMarketData({"000001.SZ": make_selector_bars("000001.SZ")})
@@ -1655,6 +2155,52 @@ class ServiceTests(unittest.TestCase):
 
 
 class ConfigEnvTests(unittest.TestCase):
+    def test_manual_weekly_selection_entry_uses_service_weekly_job(self):
+        import run_weekly_selection as manual_weekly
+
+        run_at = datetime(2026, 6, 28, 0, 30)
+        config = {
+            "paths": {
+                "portfolio": "portfolio.json",
+                "log_file": "logs/alerts.log",
+            },
+            "service": {
+                "candidate_pool_path": "data/candidates.csv",
+            },
+            "selector": {
+                "csv_path": "fallback_candidates.csv",
+            },
+        }
+        captured = {}
+
+        class FakeWeeklySelectionJob:
+            def __init__(self, portfolio_repository, candidate_pool_repository, args_factory):
+                captured["portfolio_repository"] = portfolio_repository
+                captured["candidate_pool_repository"] = candidate_pool_repository
+                captured["args_factory"] = args_factory
+
+            def __call__(self, now):
+                captured["called_at"] = now
+
+        with (
+            patch.object(manual_weekly, "ensure_local_files") as ensure_local_files,
+            patch.object(manual_weekly, "load_config", return_value=config),
+            patch.object(manual_weekly, "setup_logging") as setup_logging,
+            patch.object(manual_weekly, "PortfolioRepository", side_effect=lambda path: ("portfolio", path)),
+            patch.object(manual_weekly, "CandidatePoolRepository", side_effect=lambda path: ("pool", path)),
+            patch.object(manual_weekly, "WeeklySelectionJob", FakeWeeklySelectionJob),
+        ):
+            manual_weekly.run_weekly_selection(run_at)
+
+        ensure_local_files.assert_called_once_with()
+        setup_logging.assert_called_once_with("logs/alerts.log")
+        self.assertEqual(captured["portfolio_repository"], ("portfolio", "portfolio.json"))
+        self.assertEqual(captured["candidate_pool_repository"], ("pool", "data/candidates.csv"))
+        self.assertEqual(captured["called_at"], run_at)
+        weekly_args = captured["args_factory"](run_at)
+        self.assertEqual(weekly_args.bar_worker_mode, "process")
+        self.assertEqual(weekly_args.bar_workers, 4)
+
     def test_load_dotenv_reads_values_without_overriding_existing_environment(self):
         tmp = case_dir("dotenv")
         env_path = tmp / ".env"

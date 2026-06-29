@@ -181,6 +181,19 @@ The weekly update reuses the existing offline universe, merges the latest daily 
 refreshes market caps through the Eastmoney -> Tencent fallback chain, and writes the weekly
 selection result to `selection_results/weekly_<date>.csv`.
 
+To run the full service-style weekly selection manually, including refreshing `data/candidates.csv`
+from the weekly selection result and current portfolio positions:
+
+```powershell
+uv run python run_weekly_selection.py
+```
+
+This manual entry defaults daily-bar sync to 4 process workers. To force serial mode for debugging:
+
+```powershell
+uv run python run_weekly_selection.py --bar-worker-mode serial
+```
+
 Add `--notify-selection` to send a plain-text email report after weekly selection. The report includes
 the list before active turtle trend filtering, the final selected list, and the stocks excluded
 because they are already in an active turtle trend. The command uses the same `config.json` / `.env`

@@ -108,7 +108,7 @@ class AkshareMarketDataProvider:
                     high=self._float(self._value(row, "最高", "high")),
                     low=self._float(self._value(row, "最低", "low")),
                     close=self._float(self._value(row, "收盘", "close")),
-                    volume=int(self._float(self._value(row, "成交量", "volume", default=0))),
+                    volume=int(self._float(self._value(row, "成交量", "volume", default=0)) * 100),
                     amount=self._float_or_none(self._value(row, "成交额", "amount", default=None)),
                 )
             )
@@ -460,7 +460,7 @@ class EastmoneyMarketDataProvider:
                     close=float(fields[2]),
                     high=float(fields[3]),
                     low=float(fields[4]),
-                    volume=int(float(fields[5])),
+                    volume=int(float(fields[5]) * 100),
                     amount=float(fields[6]),
                 )
             )

@@ -10,7 +10,11 @@ from typing import Callable
 from candidate_pool import CandidatePoolRepository
 from models import StockCandidate
 from portfolio import PortfolioRepository
-from run_weekly_update import run_weekly_update
+from run_weekly_update import (
+    DEFAULT_VALIDATION_LOOKBACK_DAYS,
+    DEFAULT_VALIDATION_WINDOW,
+    run_weekly_update,
+)
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,9 @@ def build_weekly_update_args(config: dict, now: datetime) -> Namespace:
         bar_timeout_seconds=weekly_config.get("bar_timeout_seconds", 15),
         final_retry_provider=weekly_config.get("final_retry_provider", "eastmoney"),
         skip_up_to_date_bars=weekly_config.get("skip_up_to_date_bars", True),
+        validate_offline_bars=weekly_config.get("validate_offline_bars", True),
+        validation_window=weekly_config.get("validation_window", DEFAULT_VALIDATION_WINDOW),
+        validation_lookback_days=weekly_config.get("validation_lookback_days", DEFAULT_VALIDATION_LOOKBACK_DAYS),
         skip_existing_market_cap=weekly_config.get("skip_existing_market_cap", False),
         skip_market_cap_refresh=weekly_config.get("skip_market_cap_refresh", False),
         notify_selection=weekly_config.get("notify_selection", False),

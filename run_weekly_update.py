@@ -2,8 +2,8 @@ import argparse
 import csv
 import sys
 import time
-from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -17,6 +17,35 @@ from universe_provider import FallbackStockUniverseProvider
 
 
 MIN_MARKET_CAP = 20_000_000_000
+DEFAULT_VALIDATION_WINDOW = 121
+DEFAULT_VALIDATION_LOOKBACK_DAYS = 260
+
+
+@dataclass(frozen=True)
+class OfflineBarValidationIssue:
+    symbol: str
+    latest: date | None
+    expected_first: date
+    expected_last: date
+    missing_dates: tuple[date, ...]
+    actual_first: date | None
+    actual_last: date | None
+
+    def error(self) -> str:
+        latest_text = self.latest.isoformat() if self.latest else "none"
+        actual_first = self.actual_first.isoformat() if self.actual_first else "none"
+        actual_last = self.actual_last.isoformat() if self.actual_last else "none"
+        missing = ",".join(item.isoformat() for item in self.missing_dates[:10])
+        if len(self.missing_dates) > 10:
+            missing += ",..."
+        if not missing:
+            missing = "none"
+        return (
+            f"offline bars incomplete: latest={latest_text}, "
+            f"actual_range={actual_first}..{actual_last}, "
+            f"expected_range={self.expected_first.isoformat()}..{self.expected_last.isoformat()}, "
+            f"missing_dates={missing}"
+        )
 
 
 class TeeStream:
@@ -36,22 +65,7 @@ class TeeStream:
 
 def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
     store = OfflineDataStore(args.root)
-    lookback_days = args.lookback_days
-
-    primary_market_data = build_market_data_provider(
-        args.provider,
-        lookback_days,
-        akshare_timeout=args.akshare_timeout,
-        akshare_history_source=args.akshare_history_source,
-    )
-    fallback_market_data = None
-    if args.fallback != "none" and args.fallback != args.provider:
-        fallback_market_data = build_market_data_provider(
-            args.fallback,
-            lookback_days,
-            akshare_timeout=args.akshare_timeout,
-            akshare_history_source=args.akshare_history_source,
-        )
+    market_data = _build_market_data(args, args.lookback_days)
 
     retries = args.max_retries + 1 if args.max_retries else 3
     primary_universe = build_universe_provider(
@@ -74,7 +88,7 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
     sync = OfflineDataSync(
         store=store,
         universe_provider=FallbackStockUniverseProvider(primary_universe, fallback_universe),
-        market_data_provider=FallbackMarketDataProvider(primary_market_data, fallback_market_data),
+        market_data_provider=market_data,
         workers=args.workers,
         request_delay_seconds=args.request_delay,
         max_retries=args.max_retries,
@@ -84,8 +98,21 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
     if not store.universe_path.exists():
         sync.sync_universe()
 
-    target_trade_date = _resolve_target_trade_date(args, store, primary_market_data)
+    target_trade_date = _resolve_target_trade_date(args, market_data)
     print(f"[target] trade_date={target_trade_date.isoformat()}")
+    expected_trade_dates: tuple[date, ...] = ()
+    if args.validate_offline_bars:
+        validation_market_data = _build_market_data(args, args.validation_lookback_days)
+        expected_trade_dates = _resolve_expected_trade_dates(
+            args,
+            validation_market_data,
+            target_trade_date,
+        )
+        print(
+            "[bars_validation] "
+            f"window={len(expected_trade_dates)} first={expected_trade_dates[0].isoformat()} "
+            f"last={expected_trade_dates[-1].isoformat()}"
+        )
 
     universe_rows = store.load_universe()
     update_symbols = _update_scope_symbols(universe_rows, args.update_scope)
@@ -110,6 +137,7 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
         market_cap_count, market_cap_failures = sync.sync_market_caps(
             symbols=market_cap_symbols,
             skip_existing=args.skip_existing_market_cap,
+            updated_at=target_trade_date,
         )
         if market_cap_failures:
             write_failures(
@@ -123,7 +151,21 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
     selection_symbols = _selection_scope_symbols(universe_rows)
     if args.limit:
         selection_symbols = selection_symbols[: args.limit]
-    stale_symbols = _stale_symbols(store, selection_symbols, target_trade_date, args.skip_up_to_date_bars)
+    validation_issues_before = _offline_bar_validation_issues(
+        store,
+        selection_symbols,
+        expected_trade_dates,
+        target_trade_date,
+    )
+    if validation_issues_before:
+        print(f"[bars_validation] pre_sync_incomplete={len(validation_issues_before)}")
+    stale_symbols = _stale_symbols(
+        store,
+        selection_symbols,
+        target_trade_date,
+        args.skip_up_to_date_bars,
+        validation_issues_before,
+    )
     print(
         "[bars] "
         f"selection_scope={len(selection_symbols)}, stale={len(stale_symbols)}, "
@@ -137,6 +179,7 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
         target_trade_date=target_trade_date,
     )
     if bar_failures:
+        _log_bar_failures(store, bar_failures, target_trade_date)
         write_failures(
             args.failures_csv,
             bar_failures,
@@ -144,9 +187,24 @@ def run_weekly_update(args) -> tuple[int, int, int, int, Path]:
             context=_failure_context(args, stage_batch_size=0),
         )
 
+    fresh_selection_symbols, stale_selection_symbols = _fresh_selection_symbols(
+        store,
+        selection_symbols,
+        target_trade_date,
+    )
+    if stale_selection_symbols:
+        print(
+            "[bars] "
+            f"stale_after_sync={len(stale_selection_symbols)} target={target_trade_date.isoformat()}"
+        )
+        _log_stale_selection_symbols(stale_selection_symbols, target_trade_date)
+    else:
+        print(f"[bars] all selection symbols fresh target={target_trade_date.isoformat()}")
+
     selection_details = RuleBasedStockSelector(
         universe_csv_path=str(store.universe_path),
         market_data=OfflineMarketDataProvider(store),
+        eligible_symbols=fresh_selection_symbols,
     ).select_with_details(date.today())
     candidates = selection_details.selected
 
@@ -211,6 +269,9 @@ def main() -> None:
     parser.add_argument("--bar-timeout-seconds", type=float, default=15)
     parser.add_argument("--final-retry-provider", choices=["none", "akshare", "eastmoney"], default="eastmoney")
     parser.add_argument("--skip-up-to-date-bars", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validate-offline-bars", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validation-window", type=int, default=DEFAULT_VALIDATION_WINDOW)
+    parser.add_argument("--validation-lookback-days", type=int, default=DEFAULT_VALIDATION_LOOKBACK_DAYS)
     parser.add_argument(
         "--skip-existing-market-cap",
         action="store_true",
@@ -252,6 +313,24 @@ def build_notification_service() -> EmailNotificationService:
     return EmailNotificationService(SmtpEmailSender(config["email"]))
 
 
+def _build_market_data(args, lookback_days: int) -> FallbackMarketDataProvider:
+    primary_market_data = build_market_data_provider(
+        args.provider,
+        lookback_days,
+        akshare_timeout=args.akshare_timeout,
+        akshare_history_source=args.akshare_history_source,
+    )
+    fallback_market_data = None
+    if args.fallback != "none" and args.fallback != args.provider:
+        fallback_market_data = build_market_data_provider(
+            args.fallback,
+            lookback_days,
+            akshare_timeout=args.akshare_timeout,
+            akshare_history_source=args.akshare_history_source,
+        )
+    return FallbackMarketDataProvider(primary_market_data, fallback_market_data)
+
+
 def _failure_context(args, stage_batch_size: int = 0) -> dict[str, object]:
     return {
         "provider": args.provider,
@@ -264,44 +343,42 @@ def _failure_context(args, stage_batch_size: int = 0) -> dict[str, object]:
     }
 
 
-def _resolve_target_trade_date(args, store: OfflineDataStore, market_data_provider) -> date:
+def _resolve_target_trade_date(args, market_data_provider) -> date:
     if args.target_date != "auto":
         return date.fromisoformat(args.target_date)
-    local_date = _local_target_trade_date(store)
-    if local_date is not None:
-        return local_date
-    bars = market_data_provider.load_daily_bars(args.target_probe_symbol, end_date=date.today())
+    try:
+        bars = market_data_provider.load_daily_bars(args.target_probe_symbol, end_date=date.today())
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to resolve auto target trade date from probe symbol {args.target_probe_symbol}: {exc}"
+        ) from exc
     if not bars:
         raise RuntimeError(f"No bars returned for target probe symbol {args.target_probe_symbol}")
-    return bars[-1].trade_date
+    return max(bar.trade_date for bar in bars)
 
 
-def _local_target_trade_date(store: OfflineDataStore) -> date | None:
-    dates = Counter()
-    if not store.daily_dir.exists():
-        return None
-    for path in store.daily_dir.glob("*.csv"):
-        try:
-            last_line = _last_csv_data_line(path)
-        except Exception:
-            continue
-        if last_line:
-            dates[date.fromisoformat(last_line.split(",", 1)[0].lstrip("\ufeff"))] += 1
-    if not dates:
-        return None
-    return dates.most_common(1)[0][0]
-
-
-def _last_csv_data_line(path: Path) -> str:
-    last_line = ""
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped:
-                last_line = stripped
-    if last_line.startswith("date,"):
-        return ""
-    return last_line
+def _resolve_expected_trade_dates(args, market_data_provider, target_trade_date: date) -> tuple[date, ...]:
+    if args.validation_window <= 0:
+        raise RuntimeError(f"validation_window must be positive, got {args.validation_window}")
+    try:
+        bars = market_data_provider.load_daily_bars(args.target_probe_symbol, end_date=target_trade_date)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to resolve validation trade dates from probe symbol {args.target_probe_symbol}: {exc}"
+        ) from exc
+    trade_dates = sorted({bar.trade_date for bar in bars if bar.trade_date <= target_trade_date})
+    if len(trade_dates) < args.validation_window:
+        raise RuntimeError(
+            f"Validation probe symbol {args.target_probe_symbol} returned {len(trade_dates)} bars, "
+            f"less than required window {args.validation_window}"
+        )
+    expected_dates = tuple(trade_dates[-args.validation_window :])
+    if expected_dates[-1] != target_trade_date:
+        raise RuntimeError(
+            f"Validation trade calendar latest {expected_dates[-1].isoformat()} does not match "
+            f"target trade date {target_trade_date.isoformat()}"
+        )
+    return expected_dates
 
 
 def _update_scope_symbols(rows: list[dict[str, str]], update_scope: str) -> list[str]:
@@ -333,15 +410,102 @@ def _stale_symbols(
     symbols: list[str],
     target_trade_date: date,
     skip_up_to_date: bool,
+    validation_issues: list[OfflineBarValidationIssue] | None = None,
 ) -> list[str]:
+    validation_issue_symbols = {issue.symbol for issue in validation_issues or []}
     if not skip_up_to_date:
         return symbols
     stale = []
     for symbol in symbols:
         latest = store.latest_bar_date(symbol)
-        if latest != target_trade_date:
+        if latest != target_trade_date or symbol in validation_issue_symbols:
             stale.append(symbol)
     return stale
+
+
+def _fresh_selection_symbols(
+    store: OfflineDataStore,
+    symbols: list[str],
+    target_trade_date: date,
+) -> tuple[set[str], list[tuple[str, date | None, str]]]:
+    fresh_symbols: set[str] = set()
+    stale_symbols: list[tuple[str, date | None, str]] = []
+    for symbol in symbols:
+        latest = store.latest_bar_date(symbol)
+        if latest == target_trade_date:
+            fresh_symbols.add(symbol)
+            continue
+        stale_symbols.append((symbol, latest, _freshness_error(latest, target_trade_date)))
+    return fresh_symbols, stale_symbols
+
+
+def _freshness_error(latest: date | None, target_trade_date: date) -> str:
+    if latest is None:
+        return "no local bars after sync"
+    if latest < target_trade_date:
+        return f"latest bar {latest.isoformat()} before target {target_trade_date.isoformat()}"
+    return f"latest bar {latest.isoformat()} does not match target {target_trade_date.isoformat()}"
+
+
+def _offline_bar_validation_issues(
+    store: OfflineDataStore,
+    symbols: list[str],
+    expected_dates: tuple[date, ...],
+    target_trade_date: date,
+) -> list[OfflineBarValidationIssue]:
+    if not expected_dates:
+        return []
+    issues: list[OfflineBarValidationIssue] = []
+    window = len(expected_dates)
+    for symbol in symbols:
+        bars = store.load_bars(symbol, end_date=target_trade_date)
+        local_dates = [bar.trade_date for bar in bars if bar.trade_date <= target_trade_date]
+        if tuple(local_dates[-window:]) == expected_dates:
+            continue
+        local_set = set(local_dates)
+        missing_dates = tuple(trade_date for trade_date in expected_dates if trade_date not in local_set)
+        issues.append(
+            OfflineBarValidationIssue(
+                symbol=symbol,
+                latest=local_dates[-1] if local_dates else None,
+                expected_first=expected_dates[0],
+                expected_last=expected_dates[-1],
+                missing_dates=missing_dates,
+                actual_first=(
+                    local_dates[-window]
+                    if len(local_dates) >= window
+                    else (local_dates[0] if local_dates else None)
+                ),
+                actual_last=local_dates[-1] if local_dates else None,
+            )
+        )
+    return issues
+
+
+def _log_bar_failures(
+    store: OfflineDataStore,
+    failures: list[tuple[str, str]],
+    target_trade_date: date,
+) -> None:
+    for symbol, error in failures:
+        latest = store.latest_bar_date(symbol)
+        latest_text = latest.isoformat() if latest else "none"
+        print(
+            "[bars_error] "
+            f"symbol={symbol} latest={latest_text} target={target_trade_date.isoformat()} reason={error}"
+        )
+
+
+def _log_stale_selection_symbols(
+    stale_symbols: list[tuple[str, date | None, str]],
+    target_trade_date: date,
+) -> None:
+    for symbol, latest, error in stale_symbols:
+        latest_text = latest.isoformat() if latest else "none"
+        print(
+            "[bars_warning] "
+            f"symbol={symbol} latest={latest_text} target={target_trade_date.isoformat()} reason={error}"
+        )
 
 
 def _market_cap_stale_symbols(
@@ -511,9 +675,7 @@ def _sync_bars_serial(
             success_count += 1
         except Exception as exc:
             failures.append((symbol, str(exc)))
-        if args.request_delay:
-            time.sleep(args.request_delay)
-        print(f"[{stage}] {index}/{len(symbols)} success={success_count} failures={len(failures)} latest={symbol}")
+        print(f"[{stage}] {index}/{len(symbols)} success={success_count} failures={len(failures)} symbol={symbol}")
     return success_count, failures
 
 
